@@ -9,6 +9,7 @@ is the proxy port, with configuration examples that document every key.
 
 - [ ] a multi-stage Dockerfile produces an image running the service from a mounted config file
 - [ ] the compose file publishes the proxy port and leaves the management port unexposed to the host
+- [ ] the compose file attaches the service to its own network, with no route by name to any other application's containers
 - [ ] `conf.yml` and `conf-prod.yml` exist, with the production file expanding `${ENV}` variables
 - [ ] every configuration key appears in one table in `doc/config.md`, generated from the config annotations
 - [ ] the README states how to build, run and configure, including the phone-side settings (server, port, credential)

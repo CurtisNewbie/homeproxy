@@ -45,6 +45,11 @@ management: rotating a secret means editing `conf.yml` and restarting.
 18. As a developer, I want a single seam to test the proxy against a real listener and a fake upstream, so that tests exercise real HTTP behaviour rather than mocks.
 19. As the phone owner, I want an upstream failure to surface as a clear proxy error for that request only, so that a dead upstream does not wedge the listener.
 20. As a client other than the phone (e.g. drone), I want preemptive Basic on `CONNECT` to be accepted, so that non-challenging clients work without special cases.
+21. As the phone owner, I want my own domain to go direct instead of through the upstream, so that reaching my own services does not depend on the VPN.
+22. As the phone owner, I want a host that resolves to a private address refused unless I listed it, so that a leaked credential cannot reach my LAN.
+23. As the operator, I want the private-address rule on by default with no off switch, so that the proxy cannot silently become a LAN gateway.
+24. As the operator, I want the chosen egress and any policy denial in the log line, so that I can tell why a request failed.
+25. As the operator, I want the bypass list to double as the private-address exemption, so that "these hosts are mine" is stated in one place.
 
 ## Implementation Decisions
 
@@ -65,7 +70,8 @@ Configuration (all under `homeproxy.*` plus the miso `server.*` keys):
 | `homeproxy.upstream` | empty | upstream HTTP proxy as `host:port`; empty = direct |
 | `homeproxy.upstream.username` | empty | Basic username for the upstream proxy |
 | `homeproxy.upstream.password` | empty | Basic secret for the upstream proxy |
-| `homeproxy.users` | none | list of `{name, secret}`; startup fails when empty |
+| `homeproxy.users` | none | list of `{name, secret}` in plaintext; startup fails when empty |
+| `homeproxy.bypass` | none | host list, exact or `*.suffix`; matches route direct and may resolve private |
 | `homeproxy.dial-timeout-seconds` | `10` | dial + upstream CONNECT handshake timeout |
 
 Authentication: `Proxy-Authorization: Basic base64(name:secret)` read whenever present, so both
@@ -75,10 +81,20 @@ invalid credentials produce `407 Proxy Authentication Required` with
 retries on the same connection after the challenge. Secrets are compared in constant time; an
 unknown name and a wrong secret are indistinguishable in the response and the log.
 
-Forwarding: one dialer seam. A single `DialContext` resolves the egress for every connection:
+Forwarding: one egress seam. The target host is resolved first, then the egress is chosen:
 
-- upstream configured: dial the upstream, send `CONNECT target`, add `Proxy-Authorization` when upstream credentials are configured, require `200`, return the tunnelled connection.
-- upstream empty: dial the target directly.
+| # | Condition | Result |
+|---|---|---|
+| 1 | host matches `homeproxy.bypass` | dial the target directly, private addresses permitted |
+| 2 | otherwise, any resolved address is loopback, private, link-local, CGNAT, metadata or multicast | `403`, nothing dialled |
+| 3 | otherwise, `homeproxy.upstream` is set | dial the upstream, send `CONNECT target`, add `Proxy-Authorization` when upstream credentials are configured, require `200`, return the tunnelled connection |
+| 4 | otherwise | dial the target directly |
+
+Bypass matching is exact host or `*.suffix` (subdomains only), case-insensitive, port ignored.
+Resolution results are cached briefly per host so a connection does not pay a lookup per request.
+The check is best-effort on the upstream path: the upstream resolves again and may disagree, which
+is accepted rather than intercepted. When resolution itself fails, the request is handed to the
+upstream when one is configured and answered `502` when it is not, with the failure logged.
 
 `CONNECT` requests hijack the client connection, dial through that seam, answer
 `200 Connection Established`, then copy both directions, half-closing each side on EOF. A dial
@@ -123,6 +139,9 @@ Covered at that seam:
 - upstream refusing `CONNECT` → `502` to the client, listener still serving the next request.
 - hop-by-hop headers stripped; non-absolute request path → `400`.
 - half-close: client closing its write side does not truncate the response.
+- a bypass host is dialled direct even with an upstream configured, and a bypass host resolving private is allowed.
+- a non-bypass host resolving private → `403`, with no upstream and no target connection dialled.
+- a bypass host resolving public still routes direct rather than upstream.
 
 No prior test art exists in this repo; the standard library's `httptest.Server` and
 `httptest.NewTLSServer` provide the targets, and the fake upstream is a hand-written
@@ -134,6 +153,8 @@ No prior test art exists in this repo; the standard library's `httptest.Server` 
 - SOCKS5, UDP/QUIC, TLS interception or MITM, HTTP/2 to clients.
 - iOS supervision/MDM and Global HTTP Proxy payloads; the phone is configured per Wi-Fi network by hand.
 - Per-IP throttling, rate limiting, connection caps, IP allowlists.
+- CIDR, geo or geosite-based routing; only exact hosts and `*.suffix` are matched.
+- Serving a PAC file or any client-side per-domain routing.
 - Hot configuration reload; rotating credentials requires a restart.
 - Multi-user quotas and per-user bandwidth accounting beyond the log line.
 
