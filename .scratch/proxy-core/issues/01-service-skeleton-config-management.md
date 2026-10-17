@@ -6,12 +6,12 @@ every request with the authentication challenge.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `./homeproxy configFile=conf.yml` starts and logs a startup line naming both ports
-- [ ] an empty `homeproxy.users` list aborts startup with a clear message
-- [ ] `homeproxy.port` equal to `server.port` aborts startup with a clear message
-- [ ] `GET /health` on the management port returns 200
-- [ ] `GET /metrics` on the management port returns Prometheus text output
-- [ ] the proxy port accepts a TCP connection and answers both an absolute-form `GET` and a `CONNECT` with `407` and `Proxy-Authenticate: Basic realm="homeproxy"`
-- [ ] SIGTERM closes the proxy listener and exits 0
+- [x] `./homeproxy configFile=conf.yml` starts and logs a startup line naming both ports
+- [x] an empty `homeproxy.users` list aborts startup with a clear message
+- [x] `homeproxy.port` equal to `server.port` aborts startup with a clear message
+- [x] `GET /health` on the management port returns 200
+- [x] `GET /metrics` on the management port returns Prometheus text output
+- [x] the proxy port accepts a TCP connection and answers both an absolute-form `GET` and a `CONNECT` with `407` and `Proxy-Authenticate: Basic realm="homeproxy"`
+- [x] SIGTERM closes the proxy listener and exits 0

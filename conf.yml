@@ -1,0 +1,19 @@
+app:
+  name: homeproxy
+
+server:
+  port: 7990
+
+consul:
+  enabled: false
+
+metrics:
+  enabled: true
+
+homeproxy:
+  port: 17890
+  dial-timeout-seconds: 10
+  bypass: []
+  users:
+    - name: phone
+      secret: change-me
