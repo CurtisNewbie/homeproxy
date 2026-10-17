@@ -5,7 +5,7 @@ Status: ready-for-agent
 ## Problem Statement
 
 I want my iPhone to reach my home egress from any Wi-Fi network, without depending on the
-upstream proxy's own configuration. If the upstream proxy (`host:port` used by drone) changes,
+upstream proxy's own configuration. If the upstream proxy (`host:port` my other tools use) changes,
 dies, or I decide to drop it and use the machine directly, the phone must keep working and only
 the server-side config should change.
 
@@ -17,10 +17,12 @@ send a JWT. Anything device-wide would require supervising (and erasing) the pho
 
 `homeproxy`: a small standalone Go service that listens on its own port, authenticates Basic
 credentials taken from its config file, and forwards every request through a configurable
-upstream proxy — or directly when no upstream is configured. The phone is configured once with
-`host`, `port`, `username`, `password` and never needs to change when the upstream changes.
+upstream proxy — or directly when no upstream is configured, and for hosts the config marks as
+yours. The phone is configured once with `host`, `port`, `username`, `password` and never needs
+to change when the upstream changes. Any other host that resolves to a private address is
+refused, so the proxy is not a doorway into the local network.
 
-Credentials are static config values with no database, no user-vault dependency and no user
+Credentials are static config values with no database, no external identity service and no user
 management: rotating a secret means editing `conf.yml` and restarting.
 
 ## User Stories
@@ -44,7 +46,7 @@ management: rotating a secret means editing `conf.yml` and restarting.
 17. As the operator, I want the upstream's own Basic credentials configurable, so that an authenticated upstream also works.
 18. As a developer, I want a single seam to test the proxy against a real listener and a fake upstream, so that tests exercise real HTTP behaviour rather than mocks.
 19. As the phone owner, I want an upstream failure to surface as a clear proxy error for that request only, so that a dead upstream does not wedge the listener.
-20. As a client other than the phone (e.g. drone), I want preemptive Basic on `CONNECT` to be accepted, so that non-challenging clients work without special cases.
+20. As a client other than the phone (e.g. a script or another tool), I want preemptive Basic on `CONNECT` to be accepted, so that non-challenging clients work without special cases.
 21. As the phone owner, I want my own domain to go direct instead of through the upstream, so that reaching my own services does not depend on the VPN.
 22. As the phone owner, I want a host that resolves to a private address refused unless I listed it, so that a leaked credential cannot reach my LAN.
 23. As the operator, I want the private-address rule on by default with no off switch, so that the proxy cannot silently become a LAN gateway.
@@ -53,8 +55,8 @@ management: rotating a secret means editing `conf.yml` and restarting.
 
 ## Implementation Decisions
 
-Stack: Go 1.24.4, module `github.com/curtisnewbie/homeproxy`, miso pinned to the same version
-gatekeeper uses.
+Stack: Go 1.24.4, module `github.com/curtisnewbie/homeproxy`, miso pinned to
+`v0.4.16-0.20260718082143-e47321d5d9b6`.
 
 Two listeners:
 
@@ -75,7 +77,7 @@ Configuration (all under `homeproxy.*` plus the miso `server.*` keys):
 | `homeproxy.dial-timeout-seconds` | `10` | dial + upstream CONNECT handshake timeout |
 
 Authentication: `Proxy-Authorization: Basic base64(name:secret)` read whenever present, so both
-challenge-based clients (iOS) and preemptive clients (drone's surf-based client) work. Missing or
+challenge-based clients (iOS) and preemptive clients that send credentials on the first request work. Missing or
 invalid credentials produce `407 Proxy Authentication Required` with
 `Proxy-Authenticate: Basic realm="homeproxy"`, `Content-Length: 0`, connection kept open — iOS
 retries on the same connection after the challenge. Secrets are compared in constant time; an
@@ -149,7 +151,7 @@ No prior test art exists in this repo; the standard library's `httptest.Server` 
 
 ## Out of Scope
 
-- user-vault integration, proxy credentials in a database, admin UI, per-user approval flow.
+- credential database, external identity service, admin UI, per-user approval flow.
 - SOCKS5, UDP/QUIC, TLS interception or MITM, HTTP/2 to clients.
 - iOS supervision/MDM and Global HTTP Proxy payloads; the phone is configured per Wi-Fi network by hand.
 - Per-IP throttling, rate limiting, connection caps, IP allowlists.

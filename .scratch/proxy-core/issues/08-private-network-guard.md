@@ -16,3 +16,4 @@ turn the proxy into a doorway to the LAN.
 - [ ] resolution results are cached briefly, so repeated requests to one host do not repeat the lookup
 - [ ] when resolution fails, the request is handed to the upstream if one is configured and answered `502` otherwise, and the failure is logged
 - [ ] the log line distinguishes a policy denial from a dial failure
+- [ ] the guard's configuration surface, if any, appears in `doc/config.md`

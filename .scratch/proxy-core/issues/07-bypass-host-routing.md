@@ -13,3 +13,4 @@ upstream, so reaching your own services does not depend on the upstream being up
 - [ ] a host not matching any entry still goes through the upstream
 - [ ] a bypass host that resolves to a private address is dialled and allowed
 - [ ] the log line names the chosen egress for both matched and unmatched requests
+- [ ] `homeproxy.bypass` appears in `doc/config.md`
