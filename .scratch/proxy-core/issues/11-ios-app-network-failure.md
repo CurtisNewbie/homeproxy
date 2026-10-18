@@ -2,9 +2,9 @@
 
 **Status:** needs-info
 
-**Observed:** An app on the iPhone reports a network error while its traffic goes through
-homeproxy. The proxy's own log for the same period shows tunnels that were established
-(`outcome=ok`) but carried no response bytes, e.g.
+**Observed:** Xiaohongshu on the iPhone reports a network error while its traffic goes through
+homeproxy, in the same session where Chrome reaches `bing.com` normally. The proxy's log for the
+same period shows tunnels that were established (`outcome=ok`) but carried no response bytes, e.g.
 `target=api.twitter.com:443 up=517 down=0 duration=16.1s`, alongside normal tunnels
 (`down=6488` on `lng.xiaohongshu.com`). The running instance had `homeproxy.upstream` commented
 out, so every line carried `egress=direct bypass=false`.
@@ -16,6 +16,12 @@ cleanly; `down=0` is consistent with three different failures:
 - the client app never sent a request over the tunnel, or stopped reading;
 - the app's own network stack does not survive the proxy's `407` challenge or does not use the
   system proxy at all.
+
+**Probe results (Mac, through the live direct-egress proxy):** `www.xiaohongshu.com` 302,
+`edith.xiaohongshu.com` 200, `lng.xiaohongshu.com` 200, all under 0.2 s; direct requests return the
+same statuses. `sns.xiaohongshu.com` does not resolve at all (also fails direct), so it is not a
+proxy fault. This Mac has no working IPv6 route; the proxy tries the IPv6 addresses first, gets an
+immediate "no route", and succeeds on IPv4.
 
 **Info needed before diagnosing:**
 
