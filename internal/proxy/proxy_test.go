@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -10,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -416,6 +420,476 @@ func TestProxyAnswersBadGatewayWhenTargetDialFails(t *testing.T) {
 	}
 
 	assertProxyStillServing(t, addr)
+}
+
+func TestProxyForwardsAbsoluteFormGET(t *testing.T) {
+	requests := make(chan targetCapture, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- captureRequest(t, r)
+		w.Header().Set("X-Target", "target-header")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "target response body")
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/resource?q=1",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	if got := resp.Header.Get("X-Target"); got != "target-header" {
+		t.Errorf("X-Target = %q, want %q", got, "target-header")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "target response body" {
+		t.Errorf("response body = %q, want %q", body, "target response body")
+	}
+
+	got := waitForCapture(t, requests)
+	if got.method != http.MethodGet {
+		t.Errorf("target method = %q, want %q", got.method, http.MethodGet)
+	}
+	if got.uri != "/resource?q=1" {
+		t.Errorf("target request URI = %q, want %q", got.uri, "/resource?q=1")
+	}
+}
+
+func TestProxyForwardsAbsoluteFormPOSTBody(t *testing.T) {
+	const requestBody = `{"message":"payload that must survive the proxy"}`
+	requests := make(chan targetCapture, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- captureRequest(t, r)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "stored")
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodPost, target.URL+"/items",
+		basicAuth(testCredentialName, testCredentialSecret),
+		map[string]string{"Content-Type": "application/json"}, requestBody)
+
+	resp := readProxyResponse(t, conn, http.MethodPost)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "stored" {
+		t.Errorf("response body = %q, want %q", body, "stored")
+	}
+
+	got := waitForCapture(t, requests)
+	if got.method != http.MethodPost {
+		t.Errorf("target method = %q, want %q", got.method, http.MethodPost)
+	}
+	if got.uri != "/items" {
+		t.Errorf("target request URI = %q, want %q", got.uri, "/items")
+	}
+	if got.body != requestBody {
+		t.Errorf("target request body = %q, want %q", got.body, requestBody)
+	}
+}
+
+func TestProxyRejectsNonAbsoluteRequestPath(t *testing.T) {
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	raw := "GET /local/path HTTP/1.1\r\nHost: example.com\r\n" +
+		"Proxy-Authorization: " + basicAuth(testCredentialName, testCredentialSecret) + "\r\n\r\n"
+	if _, err := io.WriteString(conn, raw); err != nil {
+		t.Fatalf("write origin-form request: %v", err)
+	}
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if len(body) != 0 {
+		t.Errorf("response body = %q, want empty", body)
+	}
+}
+
+func TestProxyDoesNotForwardProxyCredentials(t *testing.T) {
+	requests := make(chan targetCapture, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- captureRequest(t, r)
+		w.Header().Set("X-Target", "ok")
+		_, _ = io.WriteString(w, "done")
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/private",
+		basicAuth(testCredentialName, testCredentialSecret),
+		map[string]string{"Proxy-Connection": "keep-alive", "X-Client-Header": "kept"}, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "done" {
+		t.Errorf("response body = %q, want %q", body, "done")
+	}
+
+	got := waitForCapture(t, requests)
+	for _, name := range []string{"Proxy-Authorization", "Proxy-Connection"} {
+		if value := got.header.Get(name); value != "" {
+			t.Errorf("%s reached the target as %q, want it consumed at the proxy", name, value)
+		}
+	}
+	if value := got.header.Get("X-Client-Header"); value != "kept" {
+		t.Errorf("X-Client-Header = %q, want %q", value, "kept")
+	}
+}
+
+func TestProxyStripsHopByHopHeaders(t *testing.T) {
+	requests := make(chan targetCapture, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- captureRequest(t, r)
+		w.Header().Set("Connection", "X-Target-Hop")
+		w.Header().Set("X-Target-Hop", "secret")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("X-Response-End-To-End", "kept")
+		_, _ = io.WriteString(w, "body")
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/headers",
+		basicAuth(testCredentialName, testCredentialSecret),
+		map[string]string{
+			"Connection":       "X-Request-Hop",
+			"X-Request-Hop":    "secret",
+			"Keep-Alive":       "timeout=5",
+			"TE":               "trailers",
+			"Upgrade":          "websocket",
+			"Proxy-Connection": "keep-alive",
+			"X-End-To-End":     "kept",
+		}, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "body" {
+		t.Errorf("response body = %q, want %q", body, "body")
+	}
+	for _, name := range []string{"Connection", "X-Target-Hop", "Keep-Alive", "Proxy-Connection"} {
+		if value := resp.Header.Get(name); value != "" {
+			t.Errorf("response header %s = %q, want it stripped", name, value)
+		}
+	}
+	if value := resp.Header.Get("X-Response-End-To-End"); value != "kept" {
+		t.Errorf("X-Response-End-To-End = %q, want %q", value, "kept")
+	}
+
+	got := waitForCapture(t, requests)
+	for _, name := range []string{"Connection", "X-Request-Hop", "Keep-Alive", "TE", "Upgrade", "Proxy-Connection"} {
+		if value := got.header.Get(name); value != "" {
+			t.Errorf("%s reached the target as %q, want it stripped", name, value)
+		}
+	}
+	if value := got.header.Get("X-End-To-End"); value != "kept" {
+		t.Errorf("X-End-To-End = %q, want %q", value, "kept")
+	}
+}
+
+func TestProxyStreamsResponseIncrementally(t *testing.T) {
+	const firstChunk = "first-chunk-"
+	const secondChunk = "second-chunk"
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseTarget := func() { releaseOnce.Do(func() { close(release) }) }
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, firstChunk)
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, secondChunk)
+	}))
+	t.Cleanup(func() {
+		releaseTarget()
+		target.Close()
+	})
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/stream",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read response head while the target was still writing: %v", err)
+	}
+	defer resp.Body.Close()
+
+	got := make([]byte, len(firstChunk))
+	if _, err := io.ReadFull(resp.Body, got); err != nil {
+		t.Fatalf("read first chunk while the target was still writing: %v", err)
+	}
+	if string(got) != firstChunk {
+		t.Errorf("first chunk = %q, want %q", got, firstChunk)
+	}
+
+	releaseTarget()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read remainder after the target finished: %v", err)
+	}
+	if string(rest) != secondChunk {
+		t.Errorf("remainder = %q, want %q", rest, secondChunk)
+	}
+}
+
+func TestProxyChallengesUnauthenticatedForwardBeforeDialing(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+targetAddr+"/", "", nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+	if got := resp.Header.Get("Proxy-Authenticate"); got != proxyAuthChallenge {
+		t.Errorf("Proxy-Authenticate = %q, want %q", got, proxyAuthChallenge)
+	}
+	if resp.ContentLength != 0 {
+		t.Errorf("Content-Length = %d, want 0", resp.ContentLength)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("target accepted %d connection(s), want 0", n)
+	}
+}
+
+func TestProxyAnswersBadGatewayWhenForwardTargetFails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve dead target: %v", err)
+	}
+	deadAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+deadAddr+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+
+	assertProxyStillServing(t, addr)
+}
+
+func TestProxyDoesNotNegotiateCompression(t *testing.T) {
+	var compressed bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressed)
+	_, _ = gzipWriter.Write([]byte("compressible payload that the proxy must not inflate"))
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatalf("build gzip body: %v", err)
+	}
+	encoded := compressed.Bytes()
+
+	requests := make(chan targetCapture, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- captureRequest(t, r)
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(encoded)))
+		_, _ = w.Write(encoded)
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// The client sends no Accept-Encoding, so the proxy must not negotiate one.
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/compressed",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+	}
+	if resp.ContentLength != int64(len(encoded)) {
+		t.Errorf("Content-Length = %d, want %d", resp.ContentLength, len(encoded))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !bytes.Equal(body, encoded) {
+		t.Errorf("body length = %d, want the %d compressed bytes unchanged", len(body), len(encoded))
+	}
+
+	got := waitForCapture(t, requests)
+	if encoding := got.header.Get("Accept-Encoding"); encoding != "" {
+		t.Errorf("target saw Accept-Encoding %q, want the proxy to add none", encoding)
+	}
+}
+
+func TestProxyAbortsClientOnTruncatedResponse(t *testing.T) {
+	const chunk = "hello"
+
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen target: %v", err)
+	}
+	t.Cleanup(func() { _ = targetLn.Close() })
+
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		request, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		_ = request.Body.Close()
+		// Announce a chunked body, deliver one chunk, then vanish without the
+		// terminal zero chunk: the response is truncated mid-stream.
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n"+chunk+"\r\n")
+	}()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+targetLn.Addr().String()+"/truncated",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatalf("truncated response read as complete, body = %q", body)
+	}
+	if string(body) != chunk {
+		t.Errorf("body before truncation = %q, want %q", body, chunk)
+	}
+}
+
+type targetCapture struct {
+	method string
+	uri    string
+	header http.Header
+	body   string
+}
+
+func captureRequest(t *testing.T, r *http.Request) targetCapture {
+	t.Helper()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("target read request body: %v", err)
+	}
+	return targetCapture{method: r.Method, uri: r.URL.RequestURI(), header: r.Header.Clone(), body: string(body)}
+}
+
+func waitForCapture(t *testing.T, requests <-chan targetCapture) targetCapture {
+	t.Helper()
+
+	select {
+	case got := <-requests:
+		return got
+	case <-time.After(5 * time.Second):
+		t.Fatal("target received no request")
+		return targetCapture{}
+	}
+}
+
+func writeAbsoluteFormRequest(t *testing.T, conn net.Conn, method, target, auth string, headers map[string]string, body string) {
+	t.Helper()
+
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		t.Fatalf("parse target URL %q: %v", target, err)
+	}
+
+	var request strings.Builder
+	fmt.Fprintf(&request, "%s %s HTTP/1.1\r\n", method, target)
+	fmt.Fprintf(&request, "Host: %s\r\n", targetURL.Host)
+	if auth != "" {
+		fmt.Fprintf(&request, "Proxy-Authorization: %s\r\n", auth)
+	}
+	for name, value := range headers {
+		fmt.Fprintf(&request, "%s: %s\r\n", name, value)
+	}
+	if body != "" {
+		fmt.Fprintf(&request, "Content-Length: %d\r\n", len(body))
+	}
+	request.WriteString("\r\n")
+	request.WriteString(body)
+
+	if _, err := io.WriteString(conn, request.String()); err != nil {
+		t.Fatalf("write absolute-form request: %v", err)
+	}
+}
+
+func readProxyResponse(t *testing.T, conn net.Conn, method string) *http.Response {
+	t.Helper()
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: method})
+	if err != nil {
+		t.Fatalf("read proxy response: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
 }
 
 func assertProxyStillServing(t *testing.T, addr string) {

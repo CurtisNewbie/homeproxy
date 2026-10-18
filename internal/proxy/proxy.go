@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -23,11 +24,25 @@ const (
 )
 
 type Proxy struct {
-	cfg config.Config
+	cfg       config.Config
+	transport *http.Transport
 }
 
 func New(cfg config.Config) *Proxy {
-	return &Proxy{cfg: cfg}
+	p := &Proxy{cfg: cfg}
+	p.transport = &http.Transport{
+		DialContext:        p.dialContext,
+		DisableCompression: true, // a proxy forwards the client's Accept-Encoding instead of negotiating its own
+	}
+	return p
+}
+
+// dialContext is the single egress seam: every outbound HTTP request reaches its
+// target through it, so later tickets can route through an upstream or apply host
+// policy in one place.
+func (p *Proxy) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: p.cfg.DialTimeout}
+	return dialer.DialContext(ctx, network, address)
 }
 
 func Serve(ln net.Listener, cfg config.Config) *http.Server {
@@ -49,14 +64,102 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method != http.MethodConnect {
-		// Ticket 03 forwards absolute-form requests. Until then the proxy holds no
-		// forwarding path and answers explicitly rather than pretending to succeed.
-		writeStatus(w, http.StatusNotImplemented)
+	if r.Method == http.MethodConnect {
+		p.tunnel(w, r)
 		return
 	}
 
-	p.tunnel(w, r)
+	p.forward(w, r)
+}
+
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
+	if !r.URL.IsAbs() || r.URL.Scheme != "http" || r.URL.Host == "" {
+		writeStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	outreq := r.Clone(r.Context())
+	outreq.RequestURI = ""
+	outreq.Host = r.URL.Host
+	stripHopByHop(outreq.Header)
+
+	resp, err := p.transport.RoundTrip(outreq)
+	if err != nil {
+		// The failure belongs to this request: report it and keep serving.
+		writeStatus(w, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	stripHopByHop(resp.Header)
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	streamBody(w, resp.Body)
+}
+
+// streamBody copies the response as it arrives and flushes after every chunk, so a
+// slow target is delivered incrementally rather than buffered to completion.
+func streamBody(w http.ResponseWriter, body io.Reader) {
+	controller := http.NewResponseController(w)
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				// The client is gone; there is nobody left to answer.
+				return
+			}
+			if err := controller.Flush(); err != nil {
+				return
+			}
+		}
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			return
+		}
+		// The headers are already sent, so the only honest signal left is to abort
+		// the connection instead of ending the body as if it were complete.
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// hopByHopHeaders are meaningful for one connection only; a proxy consumes them
+// instead of passing them on.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// stripHopByHop removes the standard hop-by-hop headers plus every header named by
+// the Connection token list (RFC 7230 section 6.1).
+func stripHopByHop(h http.Header) {
+	for _, value := range h.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if token = strings.TrimSpace(token); token != "" {
+				h.Del(token)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+}
+
+func copyHeader(dst, src http.Header) {
+	for name, values := range src {
+		for _, value := range values {
+			dst.Add(name, value)
+		}
+	}
 }
 
 func writeAuthChallenge(w http.ResponseWriter) {
@@ -102,7 +205,7 @@ func (p *Proxy) authorized(r *http.Request) bool {
 }
 
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
-	target, err := net.DialTimeout("tcp", r.Host, p.cfg.DialTimeout)
+	target, err := p.dialContext(r.Context(), "tcp", r.Host)
 	if err != nil {
 		// Still on the normal HTTP path: report the failure without opening a tunnel.
 		writeStatus(w, http.StatusBadGateway)
