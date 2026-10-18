@@ -34,6 +34,10 @@ func testProxyConfig() config.Config {
 	return config.Config{
 		Credentials: []config.Credential{{Name: testCredentialName, Secret: testCredentialSecret}},
 		DialTimeout: 2 * time.Second,
+		// Fixture servers listen on loopback, which the private-network guard
+		// refuses unless the host is declared as ours. Tests that exercise the
+		// guard clear this on purpose.
+		Bypass: []string{"127.0.0.1"},
 	}
 }
 
@@ -829,14 +833,15 @@ func TestProxyAbortsClientOnTruncatedResponse(t *testing.T) {
 func TestProxyTunnelHasNoIdleTimeoutThroughUpstream(t *testing.T) {
 	const payload = "bytes after the upstream handshake deadline"
 
-	targetAddr := startEchoTarget(t)
+	backendAddr := startEchoTarget(t)
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(backendAddr)
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	cfg.DialTimeout = 150 * time.Millisecond
 	addr := startTestProxyWithConfig(t, cfg)
 
-	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	tunnel := openTunnel(t, addr, publicTargetAuthority(t, backendAddr), basicAuth(testCredentialName, testCredentialSecret))
 	// The dial timeout covers only dialling and the upstream handshake: a tunnel
 	// that stays quiet past it must still carry bytes afterwards.
 	time.Sleep(4 * cfg.DialTimeout)
@@ -851,6 +856,9 @@ func TestProxyTunnelHasNoIdleTimeoutThroughUpstream(t *testing.T) {
 	if string(got) != payload {
 		t.Errorf("echoed bytes = %q, want %q", got, payload)
 	}
+	if seen := upstream.seen(); len(seen) != 1 || seen[0].method != http.MethodConnect {
+		t.Errorf("upstream observed %+v, want one CONNECT", seen)
+	}
 }
 
 func TestProxyTunnelPreservesBytesBufferedWithUpstreamConnectReply(t *testing.T) {
@@ -859,12 +867,13 @@ func TestProxyTunnelPreservesBytesBufferedWithUpstreamConnectReply(t *testing.T)
 
 	targetAddr := startEchoTarget(t)
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
 	upstream.setGreeting(greeting)
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	addr := startTestProxyWithConfig(t, cfg)
 
-	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	tunnel := openTunnel(t, addr, publicTargetAuthority(t, targetAddr), basicAuth(testCredentialName, testCredentialSecret))
 
 	got := make([]byte, len(greeting))
 	if _, err := io.ReadFull(tunnel, got); err != nil {
@@ -919,11 +928,12 @@ func TestProxyTunnelPreservesHalfCloseThroughUpstream(t *testing.T) {
 	}()
 
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetLn.Addr().String())
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	addr := startTestProxyWithConfig(t, cfg)
 
-	conn := openTunnel(t, addr, targetLn.Addr().String(), basicAuth(testCredentialName, testCredentialSecret))
+	conn := openTunnel(t, addr, publicTargetAuthority(t, targetLn.Addr().String()), basicAuth(testCredentialName, testCredentialSecret))
 	if _, err := io.WriteString(conn, payload); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
@@ -964,7 +974,7 @@ func TestProxyAnswersBadGatewayWhenUpstreamRejectsForwardedRequest(t *testing.T)
 
 	conn := dialProxy(t, addr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/rejected",
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, publicTargetURL(t, target.URL)+"/rejected",
 		basicAuth(testCredentialName, testCredentialSecret), nil, "")
 
 	resp := readProxyResponse(t, conn, http.MethodGet)
@@ -993,9 +1003,13 @@ func TestProxyUnreachableUpstreamYieldsBadGatewayAndKeepsServing(t *testing.T) {
 	cfg.Upstream = deadAddr
 	addr := startTestProxyWithConfig(t, cfg)
 
+	// A public, non-routable authority: the guard allows it, so the failure can
+	// only come from the dead upstream.
+	const target = "203.0.113.7:1"
+
 	conn := dialProxy(t, addr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	writeConnect(t, conn, "127.0.0.1:1", basicAuth(testCredentialName, testCredentialSecret))
+	writeConnect(t, conn, target, basicAuth(testCredentialName, testCredentialSecret))
 	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
 		t.Errorf("tunnel status with unreachable upstream = %d, want %d (headers: %v)", status, http.StatusBadGateway, headers)
 	}
@@ -1003,7 +1017,7 @@ func TestProxyUnreachableUpstreamYieldsBadGatewayAndKeepsServing(t *testing.T) {
 
 	conn = dialProxy(t, addr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://127.0.0.1:1/",
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+target+"/",
 		basicAuth(testCredentialName, testCredentialSecret), nil, "")
 	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("forward status with unreachable upstream = %d, want %d", resp.StatusCode, http.StatusBadGateway)
@@ -1020,22 +1034,25 @@ func TestProxyRefusedUpstreamConnectYieldsBadGatewayThenServesNext(t *testing.T)
 	targetAddr := strings.TrimPrefix(target.URL, "http://")
 
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
 	upstream.refuseConnect.Store(true)
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	addr := startTestProxyWithConfig(t, cfg)
 
+	publicTarget := publicTargetAuthority(t, targetAddr)
+
 	conn := dialProxy(t, addr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	writeConnect(t, conn, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	writeConnect(t, conn, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
 	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
 		t.Errorf("status after refused upstream CONNECT = %d, want %d (headers: %v)", status, http.StatusBadGateway, headers)
 	}
 	_ = conn.Close()
 
 	upstream.refuseConnect.Store(false)
-	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
-	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/after")
+	tunnel := openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+publicTarget+"/after")
 	if status != http.StatusOK {
 		t.Errorf("next tunnel status = %d, want %d", status, http.StatusOK)
 	}
@@ -1051,8 +1068,8 @@ func TestProxyRefusedUpstreamConnectYieldsBadGatewayThenServesNext(t *testing.T)
 		if obs.method != http.MethodConnect {
 			t.Errorf("upstream request %d method = %q, want %q", i, obs.method, http.MethodConnect)
 		}
-		if obs.authority != targetAddr {
-			t.Errorf("upstream request %d authority = %q, want %q", i, obs.authority, targetAddr)
+		if obs.authority != publicTarget {
+			t.Errorf("upstream request %d authority = %q, want %q", i, obs.authority, publicTarget)
 		}
 	}
 
@@ -1122,20 +1139,23 @@ func TestProxySendsUpstreamCredentials(t *testing.T) {
 			targetAddr := strings.TrimPrefix(target.URL, "http://")
 
 			upstream := startFakeUpstream(t)
+			upstream.setBackend(targetAddr)
 			cfg := testProxyConfig()
 			cfg.Upstream = upstream.addr()
 			cfg.UpstreamUsername = tt.username
 			cfg.UpstreamPassword = tt.password
 			addr := startTestProxyWithConfig(t, cfg)
 
-			tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
-			if status, _ := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/tunnelled"); status != http.StatusOK {
+			publicTarget := publicTargetAuthority(t, targetAddr)
+
+			tunnel := openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+			if status, _ := getThroughTunnel(t, tunnel, "http://"+publicTarget+"/tunnelled"); status != http.StatusOK {
 				t.Fatalf("tunnel status = %d, want %d", status, http.StatusOK)
 			}
 
 			conn := dialProxy(t, addr)
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/forwarded",
+			writeAbsoluteFormRequest(t, conn, http.MethodGet, publicTargetURL(t, target.URL)+"/forwarded",
 				basicAuth(testCredentialName, testCredentialSecret), nil, "")
 			if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
 				t.Fatalf("forward status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -1172,15 +1192,17 @@ func TestProxyForwardsAbsoluteFormThroughUpstream(t *testing.T) {
 	}))
 	defer target.Close()
 	targetURL := target.URL + "/resource?q=1"
+	publicURL := publicTargetURL(t, targetURL)
 
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(strings.TrimPrefix(target.URL, "http://"))
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	addr := startTestProxyWithConfig(t, cfg)
 
 	conn := dialProxy(t, addr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	writeAbsoluteFormRequest(t, conn, http.MethodGet, targetURL,
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, publicURL,
 		basicAuth(testCredentialName, testCredentialSecret), nil, "")
 
 	resp := readProxyResponse(t, conn, http.MethodGet)
@@ -1206,11 +1228,11 @@ func TestProxyForwardsAbsoluteFormThroughUpstream(t *testing.T) {
 	if got.method != http.MethodGet {
 		t.Errorf("upstream method = %q, want %q", got.method, http.MethodGet)
 	}
-	if got.requestURI != targetURL {
-		t.Errorf("upstream request URI = %q, want the absolute form %q", got.requestURI, targetURL)
+	if got.requestURI != publicURL {
+		t.Errorf("upstream request URI = %q, want the absolute form %q", got.requestURI, publicURL)
 	}
-	if got.authority != strings.TrimPrefix(target.URL, "http://") {
-		t.Errorf("upstream request authority = %q, want %q", got.authority, strings.TrimPrefix(target.URL, "http://"))
+	if got.authority != publicTargetAuthority(t, strings.TrimPrefix(target.URL, "http://")) {
+		t.Errorf("upstream request authority = %q, want %q", got.authority, publicTargetAuthority(t, strings.TrimPrefix(target.URL, "http://")))
 	}
 }
 
@@ -1224,12 +1246,14 @@ func TestProxyTunnelsThroughUpstream(t *testing.T) {
 	targetAddr := strings.TrimPrefix(target.URL, "http://")
 
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	addr := startTestProxyWithConfig(t, cfg)
 
-	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
-	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/tunnelled")
+	publicTarget := publicTargetAuthority(t, targetAddr)
+	tunnel := openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+publicTarget+"/tunnelled")
 	if status != http.StatusOK {
 		t.Errorf("status = %d, want %d", status, http.StatusOK)
 	}
@@ -1245,12 +1269,248 @@ func TestProxyTunnelsThroughUpstream(t *testing.T) {
 	if got.method != http.MethodConnect {
 		t.Errorf("upstream method = %q, want %q", got.method, http.MethodConnect)
 	}
-	if got.authority != targetAddr {
-		t.Errorf("upstream CONNECT authority = %q, want %q", got.authority, targetAddr)
+	if got.authority != publicTarget {
+		t.Errorf("upstream CONNECT authority = %q, want %q", got.authority, publicTarget)
 	}
-	if got.requestURI != targetAddr {
-		t.Errorf("upstream CONNECT request URI = %q, want %q", got.requestURI, targetAddr)
+	if got.requestURI != publicTarget {
+		t.Errorf("upstream CONNECT request URI = %q, want %q", got.requestURI, publicTarget)
 	}
+}
+
+func TestProxyRoutesPublicHostThroughUpstream(t *testing.T) {
+	const payload = "public target reached through the upstream"
+
+	backendAddr := startEchoTarget(t)
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(backendAddr)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	addr := startTestProxyWithConfig(t, cfg)
+
+	publicTarget := publicTargetAuthority(t, backendAddr)
+	tunnel := openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+	if _, err := io.WriteString(tunnel, payload); err != nil {
+		t.Fatalf("write through the tunnel: %v", err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(tunnel, echo); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(echo) != payload {
+		t.Errorf("echo = %q, want %q", echo, payload)
+	}
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect || seen[0].authority != publicTarget {
+		t.Errorf("upstream observed %s %s, want CONNECT %s", seen[0].method, seen[0].authority, publicTarget)
+	}
+}
+
+func TestProxyDialsPublicHostDirectlyWhenUpstreamEmpty(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.DialTimeout = 300 * time.Millisecond
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const publicTarget = "203.0.113.7:443"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+	_, status, headers := readResponseHead(t, bufio.NewReader(conn))
+
+	// A public target is not refused: the proxy tries to dial it itself, and the
+	// non-routable test address makes that dial fail.
+	if status != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d for a public target with no upstream (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+
+	assertProxyStillServing(t, addr)
+}
+
+func TestProxyUsesUpstreamWhenResolutionFails(t *testing.T) {
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	// .invalid is reserved and never resolves.
+	const unresolvable = "does-not-exist.invalid:443"
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, unresolvable, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+	_ = conn.Close()
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+unresolvable+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("forward status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+
+	seen := upstream.seen()
+	if len(seen) != 2 {
+		t.Fatalf("upstream observed %d request(s), want 2: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect || seen[0].authority != unresolvable {
+		t.Errorf("upstream observed %s %s, want CONNECT %s", seen[0].method, seen[0].authority, unresolvable)
+	}
+	if seen[1].method != http.MethodGet {
+		t.Errorf("upstream method = %q, want %q", seen[1].method, http.MethodGet)
+	}
+}
+
+func TestProxyAnswersBadGatewayWhenResolutionFailsWithoutUpstream(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const unresolvable = "does-not-exist.invalid:443"
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, unresolvable, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d, want %d before hijacking (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+	_ = conn.Close()
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+unresolvable+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("forward status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+
+	assertProxyStillServing(t, addr)
+}
+
+func TestProxyForbidsPrivateTargetBeforeUpstreamSeesIt(t *testing.T) {
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const privateTarget = "10.1.2.3:443"
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, privateTarget, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusForbidden {
+		t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusForbidden, headers)
+	}
+	_ = conn.Close()
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+privateTarget+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("forward status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0", n)
+	}
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want nothing", seen)
+	}
+
+	assertProxyStillServing(t, addr)
+}
+
+func nonPublicTargets(t *testing.T, loopbackAddr string) []string {
+	t.Helper()
+
+	_, port, err := net.SplitHostPort(loopbackAddr)
+	if err != nil {
+		t.Fatalf("split loopback address %q: %v", loopbackAddr, err)
+	}
+	// One literal per denied range: loopback, RFC1918, link-local (which covers
+	// the metadata address), CGNAT, multicast and IPv6 loopback.
+	return []string{
+		loopbackAddr,
+		net.JoinHostPort("::1", port),
+		"10.1.2.3:443",
+		"172.16.5.4:443",
+		"192.168.1.10:443",
+		"169.254.169.254:80",
+		"100.64.0.1:443",
+		"224.0.0.1:443",
+	}
+}
+
+func TestProxyForbidsConnectToNonPublicAddresses(t *testing.T) {
+	loopbackAddr, accepted := startCountingTarget(t)
+	targets := nonPublicTargets(t, loopbackAddr)
+
+	cfg := testProxyConfig()
+	cfg.Bypass = nil // nothing is exempt: the guard decides on every target
+	addr := startTestProxyWithConfig(t, cfg)
+
+	for _, target := range targets {
+		conn := dialProxy(t, addr)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		writeConnect(t, conn, target, basicAuth(testCredentialName, testCredentialSecret))
+		_, status, headers := readResponseHead(t, bufio.NewReader(conn))
+		_ = conn.Close()
+
+		if status != http.StatusForbidden {
+			t.Errorf("CONNECT %s status = %d, want %d (headers: %v)", target, status, http.StatusForbidden, headers)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("loopback target accepted %d connection(s), want 0", n)
+	}
+
+	assertProxyStillServing(t, addr)
+}
+
+func TestProxyForbidsForwardToNonPublicAddresses(t *testing.T) {
+	loopbackAddr, accepted := startCountingTarget(t)
+	targets := nonPublicTargets(t, loopbackAddr)
+
+	cfg := testProxyConfig()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	for _, target := range targets {
+		conn := dialProxy(t, addr)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+target+"/",
+			basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+		resp := readProxyResponse(t, conn, http.MethodGet)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("GET http://%s/ status = %d, want %d", target, resp.StatusCode, http.StatusForbidden)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response body for %s: %v", target, err)
+		}
+		if len(body) != 0 {
+			t.Errorf("GET http://%s/ body = %q, want empty", target, body)
+		}
+		_ = conn.Close()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("loopback target accepted %d connection(s), want 0", n)
+	}
+
+	assertProxyStillServing(t, addr)
 }
 
 func TestProxyBypassExactHostTunnelsDirectDespiteUpstream(t *testing.T) {
@@ -1353,8 +1613,9 @@ func TestProxyBypassWildcardMatchesSubdomainsNotBareSuffix(t *testing.T) {
 	}
 
 	// The bare suffix is not a subdomain and must be listed separately: it keeps
-	// using the upstream.
-	const bareTarget = "localhost:1"
+	// using the upstream. A public, non-routable authority stands in for such a
+	// host, so the guard lets it through to the upstream instead of refusing it.
+	const bareTarget = "203.0.113.7:1"
 	if status := connect(bareTarget); status != http.StatusBadGateway {
 		t.Errorf("bare suffix status = %d, want %d", status, http.StatusBadGateway)
 	}
@@ -1410,13 +1671,15 @@ func TestProxyBypassNonListedHostUsesUpstream(t *testing.T) {
 	targetAddr := strings.TrimPrefix(target.URL, "http://")
 
 	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	cfg.Bypass = []string{"other.localhost"}
 	addr := startTestProxyWithConfig(t, cfg)
 
-	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
-	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/ordinary")
+	publicTarget := publicTargetAuthority(t, targetAddr)
+	tunnel := openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+publicTarget+"/ordinary")
 	if status != http.StatusOK {
 		t.Errorf("status = %d, want %d", status, http.StatusOK)
 	}
@@ -1431,8 +1694,8 @@ func TestProxyBypassNonListedHostUsesUpstream(t *testing.T) {
 	if seen[0].method != http.MethodConnect {
 		t.Errorf("upstream method = %q, want %q", seen[0].method, http.MethodConnect)
 	}
-	if seen[0].authority != targetAddr {
-		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, targetAddr)
+	if seen[0].authority != publicTarget {
+		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, publicTarget)
 	}
 }
 
@@ -1573,6 +1836,7 @@ type upstreamObservation struct {
 type fakeUpstream struct {
 	server        *httptest.Server
 	forwarder     *http.Transport
+	backend       atomic.Value
 	mu            sync.Mutex
 	observations  []upstreamObservation
 	accepts       atomic.Int32
@@ -1614,6 +1878,45 @@ func (u *fakeUpstream) acceptCount() int32 {
 
 func (u *fakeUpstream) setGreeting(greeting string) {
 	u.greeting.Store(greeting)
+}
+
+// setBackend makes the upstream deliver every tunnelled and forwarded request to
+// this local server, modelling the internet behind a proxy: the client addresses
+// a public authority and the upstream is the one that reaches it.
+func (u *fakeUpstream) setBackend(addr string) {
+	u.backend.Store(addr)
+}
+
+func (u *fakeUpstream) deliveryTarget(authority string) string {
+	if backend, _ := u.backend.Load().(string); backend != "" {
+		return backend
+	}
+	return authority
+}
+
+// publicTargetAuthority turns a loopback fixture address into a public,
+// non-routable authority (TEST-NET-3) with the same port. A test that must route
+// through the upstream addresses it, because a loopback target would be refused
+// by the private-network guard, and a bypassed host never uses the upstream.
+func publicTargetAuthority(t *testing.T, addr string) string {
+	t.Helper()
+
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split fixture address %q: %v", addr, err)
+	}
+	return net.JoinHostPort("203.0.113.7", port)
+}
+
+func publicTargetURL(t *testing.T, targetURL string) string {
+	t.Helper()
+
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		t.Fatalf("parse fixture URL %q: %v", targetURL, err)
+	}
+	parsed.Host = publicTargetAuthority(t, parsed.Host)
+	return parsed.String()
 }
 
 func (u *fakeUpstream) handle(w http.ResponseWriter, r *http.Request) {
@@ -1663,7 +1966,7 @@ func (u *fakeUpstream) tunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer client.Close()
 
-	target, err := net.DialTimeout("tcp", r.Host, 2*time.Second)
+	target, err := net.DialTimeout("tcp", u.deliveryTarget(r.Host), 2*time.Second)
 	if err != nil {
 		_, _ = clientBuffer.WriteString("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 		_ = clientBuffer.Flush()
@@ -1699,6 +2002,10 @@ func (u *fakeUpstream) forward(w http.ResponseWriter, r *http.Request) {
 	outreq.RequestURI = ""
 	outreq.Header.Del("Proxy-Authorization")
 	outreq.Header.Del("Proxy-Connection")
+	if backend, _ := u.backend.Load().(string); backend != "" {
+		outreq.URL.Host = backend
+		outreq.Host = backend
+	}
 
 	resp, err := u.forwarder.RoundTrip(outreq)
 	if err != nil {

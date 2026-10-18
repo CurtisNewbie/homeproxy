@@ -27,6 +27,8 @@ var testBinary string
 const validCredentialsConf = `  users:
     - name: phone
       secret: s3cret
+  bypass:
+    - 127.0.0.1
 `
 
 func TestMain(m *testing.M) {
@@ -289,7 +291,7 @@ func TestProcessLogsDialFailure(t *testing.T) {
 		t.Fatalf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusBadGateway, headers)
 	}
 
-	app.waitForLine(t, "proxy dial failed", "target="+deadAddr, "error=")
+	app.waitForLine(t, "proxy tunnel failed", "target="+deadAddr, "outcome=dial-failed", "error=")
 }
 
 func proxyAuthorization(name, secret string) string {
