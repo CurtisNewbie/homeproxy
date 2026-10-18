@@ -8,19 +8,41 @@ import (
 	"github.com/curtisnewbie/miso/miso"
 )
 
+// misoconfig-section: Home Proxy Configuration
 const (
-	propProxyPort          = "homeproxy.port"
-	propCredentials        = "homeproxy.users"
-	propUpstream           = "homeproxy.upstream"
-	propUpstreamUsername   = "homeproxy.upstream.username"
-	propUpstreamPassword   = "homeproxy.upstream.password"
-	propBypass             = "homeproxy.bypass"
+	// misoconfig-prop: Port on which the forward HTTP proxy listens | 17890
+	propProxyPort = "homeproxy.port"
+
+	// misoconfig-prop: Basic auth credentials allowed to use the proxy, as a list of name/secret entries
+	propCredentials = "homeproxy.users"
+
+	// misoconfig-prop: Upstream proxy address (host:port); empty means direct connections
+	propUpstream = "homeproxy.upstream"
+
+	// misoconfig-prop: Username for authenticating against the upstream proxy
+	propUpstreamUsername = "homeproxy.upstream.username"
+
+	// misoconfig-prop: Password for authenticating against the upstream proxy
+	propUpstreamPassword = "homeproxy.upstream.password"
+
+	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-address guard; exact host or *.suffix
+	propBypass = "homeproxy.bypass"
+
+	// misoconfig-prop: Timeout in seconds for dialling a target or upstream, including the upstream CONNECT handshake | 10
 	propDialTimeoutSeconds = "homeproxy.dial-timeout-seconds"
 
-	defaultProxyPort       = 17890
-	defaultManagementPort  = 7990
-	defaultDialTimeoutSecs = 10
+	// misoconfig-prop: Port of the miso management server | 7990
+	propManagementPort = "server.port"
 )
+
+// misoconfig-default-start
+func init() {
+	miso.SetDefProp(propProxyPort, 17890)
+	miso.SetDefProp(propDialTimeoutSeconds, 10)
+	miso.SetDefProp(propManagementPort, 7990)
+}
+
+// misoconfig-default-end
 
 type Credential struct {
 	Name   string
@@ -38,16 +60,10 @@ type Config struct {
 	DialTimeout      time.Duration
 }
 
-func init() {
-	miso.SetDefProp(propProxyPort, defaultProxyPort)
-	miso.SetDefProp(propDialTimeoutSeconds, defaultDialTimeoutSecs)
-	miso.SetDefProp(miso.PropServerPort, defaultManagementPort)
-}
-
 func Load() (Config, error) {
 	cfg := Config{
 		ProxyPort:        miso.GetPropInt(propProxyPort),
-		ManagementPort:   miso.GetPropInt(miso.PropServerPort),
+		ManagementPort:   miso.GetPropInt(propManagementPort),
 		Credentials:      miso.UnmarshalFromPropKeyAs[[]Credential](propCredentials),
 		Upstream:         miso.GetPropStr(propUpstream),
 		UpstreamUsername: miso.GetPropStr(propUpstreamUsername),
