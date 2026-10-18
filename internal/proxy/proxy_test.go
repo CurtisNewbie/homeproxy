@@ -1253,6 +1253,189 @@ func TestProxyTunnelsThroughUpstream(t *testing.T) {
 	}
 }
 
+func TestProxyBypassExactHostTunnelsDirectDespiteUpstream(t *testing.T) {
+	const responseBody = "bypass target reached directly"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+	targetAddr := strings.TrimPrefix(target.URL, "http://")
+	targetHost, _, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		t.Fatalf("split target address: %v", err)
+	}
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	// The target is loopback: a bypass host is dialled and allowed even when it
+	// resolves to a private address and an upstream is configured.
+	cfg.Bypass = []string{targetHost}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/bypassed")
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if body != responseBody {
+		t.Errorf("body = %q, want %q", body, responseBody)
+	}
+
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want the bypass host dialled directly", seen)
+	}
+}
+
+func TestProxyBypassExactHostForwardsDirectDespiteUpstream(t *testing.T) {
+	const responseBody = "forwarded straight to the bypass target"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+	targetHost, _, err := net.SplitHostPort(strings.TrimPrefix(target.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split target address: %v", err)
+	}
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = []string{targetHost}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/bypassed",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != responseBody {
+		t.Errorf("body = %q, want %q", body, responseBody)
+	}
+
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want the bypass host dialled directly", seen)
+	}
+}
+
+func TestProxyBypassWildcardMatchesSubdomainsNotBareSuffix(t *testing.T) {
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = []string{"*.localhost"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	connect := func(target string) int {
+		t.Helper()
+		conn := dialProxy(t, addr)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		writeConnect(t, conn, target, basicAuth(testCredentialName, testCredentialSecret))
+		_, status, _ := readResponseHead(t, bufio.NewReader(conn))
+		_ = conn.Close()
+		return status
+	}
+
+	// A subdomain matches the wildcard: the proxy dials it itself, so the
+	// unresolvable host never reaches the upstream.
+	if status := connect("sub.localhost:1"); status != http.StatusBadGateway {
+		t.Errorf("subdomain status = %d, want %d from the direct dial", status, http.StatusBadGateway)
+	}
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v after a matching subdomain, want nothing", seen)
+	}
+
+	// The bare suffix is not a subdomain and must be listed separately: it keeps
+	// using the upstream.
+	const bareTarget = "localhost:1"
+	if status := connect(bareTarget); status != http.StatusBadGateway {
+		t.Errorf("bare suffix status = %d, want %d", status, http.StatusBadGateway)
+	}
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s) after the bare suffix, want 1: %+v", len(seen), seen)
+	}
+	if seen[0].authority != bareTarget {
+		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, bareTarget)
+	}
+}
+
+func TestProxyBypassMatchIgnoresCaseAndPort(t *testing.T) {
+	const responseBody = "matched regardless of case and port"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+	_, targetPort, err := net.SplitHostPort(strings.TrimPrefix(target.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split target address: %v", err)
+	}
+	// localhost reaches the same loopback listener, and the target authority
+	// carries a port the entry does not.
+	targetAddr := net.JoinHostPort("localhost", targetPort)
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = []string{"LoCaLhOsT"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/mixed-case")
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if body != responseBody {
+		t.Errorf("body = %q, want %q", body, responseBody)
+	}
+
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want a case-insensitive, port-ignoring match", seen)
+	}
+}
+
+func TestProxyBypassNonListedHostUsesUpstream(t *testing.T) {
+	const responseBody = "ordinary target through the upstream"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+	targetAddr := strings.TrimPrefix(target.URL, "http://")
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = []string{"other.localhost"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/ordinary")
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if body != responseBody {
+		t.Errorf("body = %q, want %q", body, responseBody)
+	}
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect {
+		t.Errorf("upstream method = %q, want %q", seen[0].method, http.MethodConnect)
+	}
+	if seen[0].authority != targetAddr {
+		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, targetAddr)
+	}
+}
+
 type targetCapture struct {
 	method string
 	uri    string
