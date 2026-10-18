@@ -28,3 +28,4 @@ services:
 networks:
   homeproxy:
     # Outbound internet access is needed: the proxy forwards traffic.
+    driver: bridge
