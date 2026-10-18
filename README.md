@@ -12,14 +12,20 @@ Local binary:
 go build -o homeproxy .
 ```
 
-Container image (multi-stage, Go 1.24 builder, distroless non-root runtime):
+Container image: the Dockerfile does not compile Go source. Build the Linux binary first, then copy
+it into a single-stage Alpine image:
 
 ```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o homeproxy_build .
 docker build -t homeproxy:local .
 ```
 
-The image runs `/usr/local/bin/homeproxy configFile=/conf/conf.yml` as a non-root user and exposes
-only the proxy port, 17890. The config file is mounted at runtime; it is not baked into the image.
+`GOOS`/`GOARCH` must match the Docker host, e.g. `GOARCH=arm64` on Apple Silicon.
+
+The image is one Alpine stage (`alpine:3.17` with `tzdata`) that copies `homeproxy_build` in as
+`./app_homeproxy` and starts it with `configFile=/usr/src/config/conf.yml`. The config file is
+mounted from the host at runtime; it is not baked into the image. The image itself declares no
+exposed ports; compose publishes only the proxy port, 17890.
 
 ## Run locally
 
@@ -42,6 +48,9 @@ export HOMEPROXY_UPSTREAM_PASSWORD=upstream-secret
 docker compose up -d --build
 ```
 
+The compose build only copies the pre-compiled `homeproxy_build`; run the Linux build step from
+[Build](#build) first.
+
 `compose.yml`:
 
 - publishes **only** `17890` (the proxy port) to the host;
@@ -49,7 +58,7 @@ docker compose up -d --build
   are reachable only from inside the container network;
 - joins only its own declared network, so other compose projects cannot reach it by name; the
   network is a naming boundary, not an isolation guarantee;
-- mounts `conf-prod.yml` read-only at `/conf/conf.yml`.
+- mounts `conf-prod.yml` read-only at `/usr/src/config/conf.yml`.
 
 Secrets: replace the placeholder `homeproxy.users` entry in `conf-prod.yml` with a long random
 secret per device before deploying (edit the host file; it is mounted, not copied).

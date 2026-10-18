@@ -5,7 +5,7 @@ services:
     image: homeproxy:local
     restart: unless-stopped
     # miso takes the config path as a CLI-style key=value argument.
-    command: ["configFile=/conf/conf.yml"]
+    command: ["configFile=/usr/src/config/conf.yml"]
     # Only the proxy port is published. server.port (management: /health,
     # /metrics, default 7990) stays inside the container and off the host.
     ports:
@@ -19,7 +19,7 @@ services:
     volumes:
       # Credentials live in this file; it must exist on the host and is read-only
       # to the container. Replace its placeholder secret before deploying.
-      - ./conf-prod.yml:/conf/conf.yml:ro
+      - ./conf-prod.yml:/usr/src/config/conf.yml:ro
     # The service joins only this project's declared network, so other compose
     # projects cannot reach it by name.
     networks:

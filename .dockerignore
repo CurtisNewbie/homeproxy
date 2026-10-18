@@ -1,11 +1,9 @@
 .git
-.gitignore
 .scratch
-docs
-doc
-*.md
-!README.md
-homeproxy
-*.test
-*.out
+
+# The local macOS binary is not used by the image; it copies the Linux build
+# output (homeproxy_build) instead.
+/homeproxy
+
+# Never send local secrets to the build daemon.
 .env

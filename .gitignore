@@ -34,3 +34,4 @@ go.work.sum
 
 # Built binary
 /homeproxy
+/homeproxy_build
