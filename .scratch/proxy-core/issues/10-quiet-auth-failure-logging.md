@@ -6,9 +6,9 @@ visible as the `homeproxy_auth_failures_total` metric.
 
 **Blocked by:** 05 (operator visibility)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] auth failures are logged at debug level and do not appear at the default info level
-- [ ] the debug line still carries the remote address and the attempted name, and no credentials
-- [ ] the end-to-end log test enables debug logging to keep asserting that line
-- [ ] `homeproxy_auth_failures_total` still counts every rejected attempt
+- [x] auth failures are logged at debug level and do not appear at the default info level
+- [x] the debug line still carries the remote address and the attempted name, and no credentials
+- [x] the end-to-end log test enables debug logging to keep asserting that line
+- [x] `homeproxy_auth_failures_total` still counts every rejected attempt

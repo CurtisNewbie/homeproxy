@@ -489,6 +489,8 @@ func writeConf(t *testing.T, proxyPort, managementPort int, extra string) string
 
 	conf := fmt.Sprintf(`app:
   name: homeproxy-test
+logging:
+  level: debug
 server:
   port: %d
 consul:

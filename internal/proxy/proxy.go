@@ -377,7 +377,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	auth := p.authenticate(r)
 	if !auth.ok {
 		authFailuresTotal.Inc()
-		miso.Warnf("proxy auth failed remote=%s name=%q", r.RemoteAddr, auth.attempted)
+		miso.Debugf("proxy auth failed remote=%s name=%q", r.RemoteAddr, auth.attempted)
 		writeAuthChallenge(w)
 		return
 	}
