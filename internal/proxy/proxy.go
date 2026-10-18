@@ -40,11 +40,12 @@ type Proxy struct {
 	cfg       config.Config
 	upstream  *upstream
 	bypass    bypassList
+	resolver  *resolver
 	transport *http.Transport
 }
 
 func New(cfg config.Config) *Proxy {
-	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass)}
+	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), resolver: newResolver()}
 	if cfg.Upstream != "" {
 		p.upstream = &upstream{
 			addr: cfg.Upstream,
@@ -129,25 +130,47 @@ func hostOnly(authority string) string {
 }
 
 // egress is the one egress decision for a target: the upstream to dial through
-// (nil means dial the target directly) and whether homeproxy.bypass chose the
-// direct route. Tunnels and forwarded requests both route through it.
+// (nil means dial the target directly), whether homeproxy.bypass chose the direct
+// route, and any reason the target must not be reached at all. Tunnels and
+// forwarded requests both route through it.
 type egress struct {
 	upstream *upstream
 	bypass   bool
+	// refusal is the private-network guard's verdict on a non-bypass host.
+	refusal error
+	// lookupFailure is a failed host resolution. An upstream, when configured,
+	// resolves again itself, so the request is still handed to it; without an
+	// upstream there is nothing left to dial.
+	lookupFailure error
 }
 
 func (e egress) name() string {
+	if e.refusal != nil {
+		return "refused"
+	}
 	if e.upstream == nil {
 		return "direct"
 	}
 	return "upstream"
 }
 
-// egressFor resolves the target host against homeproxy.bypass, then applies the
-// configured upstream. The result is the only place the egress is chosen.
+// egressFor resolves the target host against homeproxy.bypass, applies the
+// private-network guard to every other host, then applies the configured
+// upstream. The result is the only place the egress is chosen.
 func (p *Proxy) egressFor(target string) egress {
 	if p.bypass.matches(target) {
 		return egress{bypass: true}
+	}
+
+	host := hostOnly(target)
+	addresses, err := p.resolver.resolve(context.Background(), host)
+	if err != nil {
+		return egress{upstream: p.upstream, lookupFailure: err}
+	}
+	for _, address := range addresses {
+		if nonPublic(address.IP) {
+			return egress{refusal: fmt.Errorf("%w: %s resolves to %s", errGuardRefused, host, address.IP)}
+		}
 	}
 	return egress{upstream: p.upstream}
 }
@@ -178,10 +201,18 @@ func (p *Proxy) dialContext(ctx context.Context, network, address string) (net.C
 
 // reach opens the connection a CONNECT tunnel runs over. It is the tunnel half of
 // the single egress decision: direct when the target is bypassed, otherwise the
-// parsed upstream or a direct dial of the target.
+// parsed upstream or a direct dial of the target. A target the private-network
+// guard refuses, or an unresolvable one with no upstream to hand it to, returns an
+// error before anything is dialled.
 func (p *Proxy) reach(ctx context.Context, target string) (net.Conn, error) {
 	chosen := p.egressFor(target)
+	if chosen.refusal != nil {
+		return nil, chosen.refusal
+	}
 	if chosen.upstream == nil {
+		if chosen.lookupFailure != nil {
+			return nil, chosen.lookupFailure
+		}
 		return p.dialContext(ctx, "tcp", target)
 	}
 	return p.dialUpstream(ctx, chosen.upstream, target)
@@ -314,6 +345,24 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential strin
 	if !r.URL.IsAbs() || r.URL.Scheme != "http" || r.URL.Host == "" {
 		outcome = strconv.Itoa(http.StatusBadRequest)
 		writeStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	// The private-network guard runs before the request reaches the transport, so
+	// neither the upstream nor the target sees a refused request.
+	if chosen.refusal != nil {
+		failure = chosen.refusal
+		outcome = strconv.Itoa(http.StatusForbidden)
+		writeStatus(w, http.StatusForbidden)
+		return
+	}
+
+	// A failed lookup leaves nothing to dial when no upstream is configured; the
+	// upstream resolves the host again itself, so it is used when it exists.
+	if chosen.lookupFailure != nil && chosen.upstream == nil {
+		failure = chosen.lookupFailure
+		outcome = strconv.Itoa(http.StatusBadGateway)
+		writeStatus(w, http.StatusBadGateway)
 		return
 	}
 
@@ -513,9 +562,16 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, credential string
 	target, err := p.reach(r.Context(), r.Host)
 	if err != nil {
 		// Still on the normal HTTP path: report the failure without opening a tunnel.
-		miso.Errorf("proxy dial failed credential=%s target=%s egress=%s bypass=%t duration=%s outcome=dial-failed error=%v",
-			credential, r.Host, chosen.name(), chosen.bypass, time.Since(start), err)
-		writeStatus(w, http.StatusBadGateway)
+		// A policy refusal is not a dial failure; it is logged as its own outcome.
+		outcome := "dial-failed"
+		status := http.StatusBadGateway
+		if errors.Is(err, errGuardRefused) {
+			outcome = "forbidden"
+			status = http.StatusForbidden
+		}
+		miso.Errorf("proxy tunnel failed credential=%s target=%s egress=%s bypass=%t duration=%s outcome=%s error=%v",
+			credential, r.Host, chosen.name(), chosen.bypass, time.Since(start), outcome, err)
+		writeStatus(w, status)
 		return
 	}
 	defer target.Close()
