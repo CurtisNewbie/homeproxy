@@ -12,6 +12,7 @@ metrics:
 
 homeproxy:
   port: 17890
+  # upstream: "127.0.0.1:7897"
   dial-timeout-seconds: 10
   bypass: []
   users:
