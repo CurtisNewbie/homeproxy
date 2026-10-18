@@ -20,14 +20,11 @@ services:
       # Credentials live in this file; it must exist on the host and is read-only
       # to the container. Replace its placeholder secret before deploying.
       - ./conf-prod.yml:/conf/conf.yml:ro
-    # Dedicated network, not shared with any other application's containers:
-    # nothing else can reach this service by name, and the proxy cannot reach
-    # other applications' containers by name.
+    # The service joins only this project's declared network, so other compose
+    # projects cannot reach it by name.
     networks:
       - homeproxy
 
 networks:
   homeproxy:
-    # Outbound internet access is needed (the proxy forwards traffic); the
-    # network is isolated from every other compose project.
-    internal: false
+    # Outbound internet access is needed: the proxy forwards traffic.

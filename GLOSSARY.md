@@ -21,6 +21,16 @@ The HTTP proxy that homeproxy hands connections to when an egress other than dir
 configured.
 _Avoid_: parent proxy, chained proxy
 
+**Bypass**:
+A host list — exact host or `*.suffix` — whose entries use the direct egress and are exempt from the
+private-network guard.
+_Avoid_: route, whitelist, no-proxy list
+
+**Private-network guard**:
+The always-on check that refuses a non-bypass host resolving to a non-public address, before any
+connection is dialled.
+_Avoid_: private-address guard, SSRF filter
+
 **Tunnel**:
 The bidirectional byte stream a `CONNECT` request opens between client and target.
 _Avoid_: session, connection

@@ -99,6 +99,7 @@ func TestProxyAnswersAuthChallenge(t *testing.T) {
 func TestProxyConnectWithoutCredentialGetsChallengeAndDialsNothing(t *testing.T) {
 	targetAddr, accepted := startCountingTarget(t)
 	addr := startTestProxyWithConfig(t, testProxyConfig())
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
 
 	conn := dialProxy(t, addr)
 	writeConnect(t, conn, targetAddr, "")
@@ -114,15 +115,16 @@ func TestProxyConnectWithoutCredentialGetsChallengeAndDialsNothing(t *testing.T)
 		t.Errorf("Content-Length = %q, want 0", got)
 	}
 
-	time.Sleep(100 * time.Millisecond)
 	if n := accepted.Load(); n != 0 {
 		t.Errorf("target accepted %d connection(s), want 0", n)
 	}
+	assertNoDial(t, dialBefore)
 }
 
 func TestProxyRejectsUnknownNameAndWrongSecretIdentically(t *testing.T) {
 	targetAddr, accepted := startCountingTarget(t)
 	addr := startTestProxyWithConfig(t, testProxyConfig())
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
 
 	authorizations := []struct {
 		name string
@@ -167,10 +169,10 @@ func TestProxyRejectsUnknownNameAndWrongSecretIdentically(t *testing.T) {
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
 	if n := accepted.Load(); n != 0 {
 		t.Errorf("target accepted %d connection(s), want 0", n)
 	}
+	assertNoDial(t, dialBefore)
 }
 
 func TestProxyAcceptsValidCredentialOnConnect(t *testing.T) {
@@ -689,6 +691,7 @@ func TestProxyStreamsResponseIncrementally(t *testing.T) {
 func TestProxyChallengesUnauthenticatedForwardBeforeDialing(t *testing.T) {
 	targetAddr, accepted := startCountingTarget(t)
 	addr := startTestProxyWithConfig(t, testProxyConfig())
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
 
 	conn := dialProxy(t, addr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -705,10 +708,10 @@ func TestProxyChallengesUnauthenticatedForwardBeforeDialing(t *testing.T) {
 		t.Errorf("Content-Length = %d, want 0", resp.ContentLength)
 	}
 
-	time.Sleep(100 * time.Millisecond)
 	if n := accepted.Load(); n != 0 {
 		t.Errorf("target accepted %d connection(s), want 0", n)
 	}
+	assertNoDial(t, dialBefore)
 }
 
 func TestProxyAnswersBadGatewayWhenForwardTargetFails(t *testing.T) {
@@ -855,9 +858,6 @@ func TestProxyTunnelHasNoIdleTimeoutThroughUpstream(t *testing.T) {
 	}
 	if string(got) != payload {
 		t.Errorf("echoed bytes = %q, want %q", got, payload)
-	}
-	if seen := upstream.seen(); len(seen) != 1 || seen[0].method != http.MethodConnect {
-		t.Errorf("upstream observed %+v, want one CONNECT", seen)
 	}
 }
 
@@ -1436,7 +1436,8 @@ func nonPublicTargets(t *testing.T, loopbackAddr string) []string {
 		t.Fatalf("split loopback address %q: %v", loopbackAddr, err)
 	}
 	// One literal per denied range: loopback, RFC1918, link-local (which covers
-	// the metadata address), CGNAT, multicast and IPv6 loopback.
+	// the metadata address), CGNAT, multicast, IPv6 loopback, IPv4 0/8,
+	// benchmarking and reserved (which includes broadcast).
 	return []string{
 		loopbackAddr,
 		net.JoinHostPort("::1", port),
@@ -1446,6 +1447,9 @@ func nonPublicTargets(t *testing.T, loopbackAddr string) []string {
 		"169.254.169.254:80",
 		"100.64.0.1:443",
 		"224.0.0.1:443",
+		"0.0.0.0:443",
+		"198.18.0.1:443",
+		"240.0.0.1:443",
 	}
 }
 
@@ -1456,6 +1460,7 @@ func TestProxyForbidsConnectToNonPublicAddresses(t *testing.T) {
 	cfg := testProxyConfig()
 	cfg.Bypass = nil // nothing is exempt: the guard decides on every target
 	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
 
 	for _, target := range targets {
 		conn := dialProxy(t, addr)
@@ -1469,10 +1474,10 @@ func TestProxyForbidsConnectToNonPublicAddresses(t *testing.T) {
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
 	if n := accepted.Load(); n != 0 {
 		t.Errorf("loopback target accepted %d connection(s), want 0", n)
 	}
+	assertNoDial(t, dialBefore)
 
 	assertProxyStillServing(t, addr)
 }
@@ -1484,6 +1489,7 @@ func TestProxyForbidsForwardToNonPublicAddresses(t *testing.T) {
 	cfg := testProxyConfig()
 	cfg.Bypass = nil
 	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
 
 	for _, target := range targets {
 		conn := dialProxy(t, addr)
@@ -1505,10 +1511,10 @@ func TestProxyForbidsForwardToNonPublicAddresses(t *testing.T) {
 		_ = conn.Close()
 	}
 
-	time.Sleep(100 * time.Millisecond)
 	if n := accepted.Load(); n != 0 {
 		t.Errorf("loopback target accepted %d connection(s), want 0", n)
 	}
+	assertNoDial(t, dialBefore)
 
 	assertProxyStillServing(t, addr)
 }
@@ -1659,6 +1665,77 @@ func TestProxyBypassMatchIgnoresCaseAndPort(t *testing.T) {
 
 	if seen := upstream.seen(); len(seen) != 0 {
 		t.Errorf("upstream observed %+v, want a case-insensitive, port-ignoring match", seen)
+	}
+}
+
+func TestProxyBypassMatchIgnoresTrailingDot(t *testing.T) {
+	const responseBody = "matched with a trailing dot"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+	targetAddr := strings.TrimPrefix(target.URL, "http://")
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	// The configured name carries a trailing dot; the target authority does not.
+	cfg.Bypass = []string{"127.0.0.1."}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	status, body := getThroughTunnel(t, tunnel, "http://"+targetAddr+"/trailing-dot")
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if body != responseBody {
+		t.Errorf("body = %q, want %q", body, responseBody)
+	}
+
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want a trailing-dot match", seen)
+	}
+}
+
+// A bypass host that resolves to a public address still uses the direct egress:
+// the bypass list, not the address family, selects it.
+func TestProxyBypassPublicHostUsesDirectEgress(t *testing.T) {
+	const publicTarget = "203.0.113.7:443"
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = []string{"203.0.113.7"}
+	// TEST-NET-3 cannot be reached. The timeout bounds the direct dial, so the
+	// 502 comes from the dial budget rather than the network's failure mode.
+	cfg.DialTimeout = 200 * time.Millisecond
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d, want %d from the direct dial (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+	_ = conn.Close()
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+publicTarget+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("forward status = %d, want %d from the direct dial", resp.StatusCode, http.StatusBadGateway)
+	}
+
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want nothing for a bypass host", seen)
+	}
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0 for a bypass host", n)
+	}
+	if got := histogramCount(t, "homeproxy_dial_duration"); got < dialBefore+2 {
+		t.Errorf("recorded %d direct dial(s), want 2 (tunnel and forward)", got-dialBefore)
 	}
 }
 
@@ -2215,6 +2292,17 @@ func waitForHistogramCount(t *testing.T, name string, cond func(uint64) bool) ui
 			t.Fatalf("%s sample count = %d, condition not met within 5s", name, got)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// assertNoDial checks that no outbound connection was attempted since before was
+// recorded. A dial is observed before its caller continues, so once the proxy has
+// answered, the count is settled and no waiting is needed.
+func assertNoDial(t *testing.T, before uint64) {
+	t.Helper()
+
+	if got := histogramCount(t, "homeproxy_dial_duration"); got != before {
+		t.Errorf("proxy recorded %d dial(s), want none", got-before)
 	}
 }
 

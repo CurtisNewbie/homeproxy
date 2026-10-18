@@ -11,6 +11,6 @@ For more configuration, see [github.com/curtisnewbie/miso](https://github.com/Cu
 | homeproxy.upstream             | Upstream proxy address (host:port); empty means direct connections                                         |               |
 | homeproxy.upstream.username    | Username for authenticating against the upstream proxy                                                     |               |
 | homeproxy.upstream.password    | Password for authenticating against the upstream proxy                                                     |               |
-| homeproxy.bypass               | Hosts that bypass the upstream proxy and are exempt from the private-address guard; exact host or *.suffix |               |
+| homeproxy.bypass               | Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host or *.suffix |               |
 | homeproxy.dial-timeout-seconds | Timeout in seconds for dialling a target or upstream, including the upstream CONNECT handshake             | 10            |
 | server.port                    | Port of the miso management server                                                                         | 7990          |

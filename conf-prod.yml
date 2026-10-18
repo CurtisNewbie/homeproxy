@@ -21,7 +21,7 @@ homeproxy:
   upstream.password: "${HOMEPROXY_UPSTREAM_PASSWORD:}"
   # List props are NOT expanded from ${ENV}; entries are literal. Exact host or
   # *.suffix; hosts listed here bypass the upstream and are exempt from the
-  # private-address guard.
+  # private-network guard.
   bypass: []
   # List props are NOT expanded from ${ENV} either: the name and secret below
   # are literal values. Replace the placeholder with a long random secret per

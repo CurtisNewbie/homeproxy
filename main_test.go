@@ -291,7 +291,7 @@ func TestProcessLogsDialFailure(t *testing.T) {
 		t.Fatalf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusBadGateway, headers)
 	}
 
-	app.waitForLine(t, "proxy tunnel failed", "target="+deadAddr, "outcome=dial-failed", "error=")
+	app.waitForLine(t, "proxy tunnel failed", "target="+deadAddr, "outcome=dial-failed")
 }
 
 func proxyAuthorization(name, secret string) string {

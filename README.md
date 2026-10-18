@@ -47,9 +47,8 @@ docker compose up -d --build
 - publishes **only** `17890` (the proxy port) to the host;
 - leaves the management port (`server.port`, default `7990`) unpublished — `/health` and `/metrics`
   are reachable only from inside the container network;
-- attaches the service to its own dedicated network, declared in the file and not shared with any
-  other application, so no other container can reach it by name and it cannot reach other
-  applications' containers by name;
+- joins only its own declared network, so other compose projects cannot reach it by name; the
+  network is a naming boundary, not an isolation guarantee;
 - mounts `conf-prod.yml` read-only at `/conf/conf.yml`.
 
 Secrets: replace the placeholder `homeproxy.users` entry in `conf-prod.yml` with a long random
@@ -58,8 +57,9 @@ secret per device before deploying (edit the host file; it is mounted, not copie
 ## Configure
 
 Every key the service reads is documented in one table, generated from the config annotations:
-[doc/config.md](doc/config.md). The table also covers the miso management port. Config is read once
-at startup; rotating a credential or changing the upstream means editing the file and restarting.
+[doc/config.md](doc/config.md). The table also covers the miso management port. Regenerate it with
+`misoconfig -path doc/config.md`; do not edit the generated table by hand. Config is read once at
+startup; rotating a credential or changing the upstream means editing the file and restarting.
 
 `${VAR}` / `${VAR:default}` expansion applies **only to string props** — `homeproxy.upstream`,
 `homeproxy.upstream.username`, `homeproxy.upstream.password` — because those are read as strings,
@@ -84,7 +84,7 @@ port is plain HTTP with Basic auth (iOS cannot speak TLS to a proxy), so treat i
 public-but-credentialled: use a long random secret rather than a memorable one, and give each device
 its own.
 
-Hosts not listed in `homeproxy.bypass` that resolve to a private address are refused (the
-private-address guard) — loopback, private, link-local, CGNAT, metadata and multicast ranges. List a
-host in `homeproxy.bypass` (exact host or `*.suffix`) when it is yours; bypassed hosts route direct
-and are exempt from that guard.
+Hosts not listed in `homeproxy.bypass` that resolve to a non-public address are refused (the
+private-network guard) — loopback, private, link-local, CGNAT, benchmarking, reserved, metadata and
+multicast ranges. List a host in `homeproxy.bypass` (exact host or `*.suffix`) when it is yours;
+bypassed hosts use the direct egress and are exempt from that guard.
