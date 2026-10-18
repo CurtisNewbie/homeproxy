@@ -1,14 +1,17 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -23,26 +26,135 @@ const (
 	basicAuthPrefix        = "Basic "
 )
 
+// upstream is the parsed homeproxy.upstream value. A nil *upstream means direct
+// egress; it is parsed once in New so no code path re-reads the config string.
+type upstream struct {
+	addr          string
+	url           *url.URL
+	authorization string
+}
+
 type Proxy struct {
 	cfg       config.Config
+	upstream  *upstream
 	transport *http.Transport
 }
 
 func New(cfg config.Config) *Proxy {
 	p := &Proxy{cfg: cfg}
+	if cfg.Upstream != "" {
+		p.upstream = &upstream{
+			addr: cfg.Upstream,
+			url:  &url.URL{Scheme: "http", Host: cfg.Upstream},
+		}
+		if cfg.UpstreamUsername != "" || cfg.UpstreamPassword != "" {
+			// userinfo makes the transport add Proxy-Authorization on forwarded
+			// requests; the tunnel path writes the same header itself.
+			p.upstream.url.User = url.UserPassword(cfg.UpstreamUsername, cfg.UpstreamPassword)
+			p.upstream.authorization = "Basic " + base64.StdEncoding.EncodeToString(
+				[]byte(cfg.UpstreamUsername+":"+cfg.UpstreamPassword))
+		}
+	}
 	p.transport = &http.Transport{
 		DialContext:        p.dialContext,
+		Proxy:              p.proxyURL,
 		DisableCompression: true, // a proxy forwards the client's Accept-Encoding instead of negotiating its own
 	}
 	return p
 }
 
-// dialContext is the single egress seam: every outbound HTTP request reaches its
-// target through it, so later tickets can route through an upstream or apply host
-// policy in one place.
+// proxyURL is the forward half of the single egress decision: the upstream URL
+// when one is configured, nil for a direct dial of the request's target.
+func (p *Proxy) proxyURL(*http.Request) (*url.URL, error) {
+	if p.upstream == nil {
+		return nil, nil
+	}
+	return p.upstream.url, nil
+}
+
+// dialContext is the only function that opens outbound connections. The one
+// parsed upstream value decides the address it is given (the upstream when
+// configured, the target otherwise), so tunnels and forwarded requests share
+// both the egress decision and the dialler.
 func (p *Proxy) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: p.cfg.DialTimeout}
 	return dialer.DialContext(ctx, network, address)
+}
+
+// reach opens the connection a CONNECT tunnel runs over. It is the tunnel half of
+// the single egress decision: the parsed upstream or a direct dial of the target.
+func (p *Proxy) reach(ctx context.Context, target string) (net.Conn, error) {
+	if p.upstream == nil {
+		return p.dialContext(ctx, "tcp", target)
+	}
+	return p.dialUpstream(ctx, target)
+}
+
+// dialUpstream dials the configured upstream and asks it for a tunnel to target.
+// Any bytes the upstream sent after its status line stay readable from the
+// returned connection.
+func (p *Proxy) dialUpstream(ctx context.Context, target string) (net.Conn, error) {
+	// One budget covers dialling and the CONNECT handshake together.
+	var deadline time.Time
+	if p.cfg.DialTimeout > 0 {
+		deadline = time.Now().Add(p.cfg.DialTimeout)
+	}
+
+	conn, err := p.dialContext(ctx, "tcp", p.upstream.addr)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (net.Conn, error) {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	if !deadline.IsZero() {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	reader := bufio.NewReader(conn)
+	var request strings.Builder
+	fmt.Fprintf(&request, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	if p.upstream.authorization != "" {
+		fmt.Fprintf(&request, "Proxy-Authorization: %s\r\n", p.upstream.authorization)
+	}
+	request.WriteString("\r\n")
+	if _, err := io.WriteString(conn, request.String()); err != nil {
+		return fail(err)
+	}
+
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return fail(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fail(fmt.Errorf("upstream refused CONNECT to %s: %s", target, resp.Status))
+	}
+
+	// The handshake is over: a tunnel carries long-lived traffic and has no idle
+	// timeout, so the dial deadline must not survive into it.
+	if !deadline.IsZero() {
+		_ = conn.SetDeadline(time.Time{})
+	}
+
+	return &upstreamConn{Conn: conn, reader: reader}, nil
+}
+
+// upstreamConn reads through the bufio.Reader the CONNECT response was parsed
+// from, so a fast upstream cannot lose bytes it sent behind the status line.
+type upstreamConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *upstreamConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *upstreamConn) CloseWrite() error {
+	closeWrite(c.Conn)
+	return nil
 }
 
 func Serve(ln net.Listener, cfg config.Config) *http.Server {
@@ -86,10 +198,20 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	resp, err := p.transport.RoundTrip(outreq)
 	if err != nil {
 		// The failure belongs to this request: report it and keep serving.
+		miso.Errorf("proxy cannot forward to %s: %v", r.URL.Host, err)
 		writeStatus(w, http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	// A 407 from a configured upstream rejects homeproxy's own credentials, not
+	// the client's: it must not masquerade as the client's auth challenge. The
+	// tunnel path already treats it as a gateway failure.
+	if p.upstream != nil && resp.StatusCode == http.StatusProxyAuthRequired {
+		miso.Errorf("upstream rejected credentials for %s: %s", r.URL.Host, resp.Status)
+		writeStatus(w, http.StatusBadGateway)
+		return
+	}
 
 	stripHopByHop(resp.Header)
 	copyHeader(w.Header(), resp.Header)
@@ -205,9 +327,10 @@ func (p *Proxy) authorized(r *http.Request) bool {
 }
 
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
-	target, err := p.dialContext(r.Context(), "tcp", r.Host)
+	target, err := p.reach(r.Context(), r.Host)
 	if err != nil {
 		// Still on the normal HTTP path: report the failure without opening a tunnel.
+		miso.Errorf("proxy cannot reach %s: %v", r.Host, err)
 		writeStatus(w, http.StatusBadGateway)
 		return
 	}
