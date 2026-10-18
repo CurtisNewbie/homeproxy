@@ -1,6 +1,6 @@
 # homeproxy — authenticated forward HTTP proxy
 
-Status: ready-for-agent
+Status: done
 
 ## Problem Statement
 
