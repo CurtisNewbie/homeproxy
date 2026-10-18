@@ -108,7 +108,8 @@ Hop-by-hop headers and `Proxy-Authorization`/`Proxy-Connection` are stripped bef
 `Connection` token lists are honoured per RFC 7230. A non-absolute request path answers `400`.
 
 Logging: one line per finished tunnel or forwarded request — user name, target, bytes up/down,
-duration, outcome. Auth failures log remote address and user name only. Credentials, config
+duration, outcome. Auth failures log at debug level with remote address and user name only.
+Credentials, config
 secrets and `Proxy-Authorization` values never reach logs.
 
 Metrics: `homeproxy_bytes_up_total`, `homeproxy_bytes_down_total`,
