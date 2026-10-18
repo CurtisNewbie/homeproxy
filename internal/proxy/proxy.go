@@ -39,11 +39,12 @@ type upstream struct {
 type Proxy struct {
 	cfg       config.Config
 	upstream  *upstream
+	bypass    bypassList
 	transport *http.Transport
 }
 
 func New(cfg config.Config) *Proxy {
-	p := &Proxy{cfg: cfg}
+	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass)}
 	if cfg.Upstream != "" {
 		p.upstream = &upstream{
 			addr: cfg.Upstream,
@@ -65,19 +66,105 @@ func New(cfg config.Config) *Proxy {
 	return p
 }
 
-// proxyURL is the forward half of the single egress decision: the upstream URL
-// when one is configured, nil for a direct dial of the request's target.
-func (p *Proxy) proxyURL(*http.Request) (*url.URL, error) {
-	if p.upstream == nil {
-		return nil, nil
+// requestTarget is the authority a request is addressed to, whether the client
+// sent an absolute-form request or a CONNECT tunnel.
+func requestTarget(r *http.Request) string {
+	if r.URL.Host != "" {
+		return r.URL.Host
 	}
-	return p.upstream.url, nil
+	return r.Host
 }
 
-// dialContext is the only function that opens outbound connections. The one
-// parsed upstream value decides the address it is given (the upstream when
-// configured, the target otherwise), so tunnels and forwarded requests share
-// both the egress decision and the dialler.
+// bypassList is the parsed homeproxy.bypass value, normalized once in New so no
+// request path re-reads or re-parses the configured strings.
+type bypassList struct {
+	hosts    map[string]struct{}
+	suffixes []string
+}
+
+func newBypassList(entries []string) bypassList {
+	list := bypassList{hosts: make(map[string]struct{}, len(entries))}
+	for _, entry := range entries {
+		entry = hostOnly(entry)
+		if entry == "" {
+			continue
+		}
+		if suffix, ok := strings.CutPrefix(entry, "*."); ok {
+			if suffix != "" {
+				list.suffixes = append(list.suffixes, suffix)
+			}
+			continue
+		}
+		list.hosts[entry] = struct{}{}
+	}
+	return list
+}
+
+// matches reports whether target's host is listed. Matching is case-insensitive
+// and ignores the port, so "Example.COM:443" matches an "example.com" entry. A
+// "*.suffix" entry matches subdomains only; the bare suffix is not a subdomain.
+func (b bypassList) matches(target string) bool {
+	host := hostOnly(target)
+	if _, ok := b.hosts[host]; ok {
+		return true
+	}
+	for _, suffix := range b.suffixes {
+		if strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOnly reduces an authority to the comparable part of a host name: no port,
+// no IPv6 brackets, lowercase.
+func hostOnly(authority string) string {
+	authority = strings.TrimSpace(authority)
+	if host, _, err := net.SplitHostPort(authority); err == nil {
+		authority = host
+	}
+	authority = strings.TrimPrefix(authority, "[")
+	authority = strings.TrimSuffix(authority, "]")
+	return strings.ToLower(authority)
+}
+
+// egress is the one egress decision for a target: the upstream to dial through
+// (nil means dial the target directly) and whether homeproxy.bypass chose the
+// direct route. Tunnels and forwarded requests both route through it.
+type egress struct {
+	upstream *upstream
+	bypass   bool
+}
+
+func (e egress) name() string {
+	if e.upstream == nil {
+		return "direct"
+	}
+	return "upstream"
+}
+
+// egressFor resolves the target host against homeproxy.bypass, then applies the
+// configured upstream. The result is the only place the egress is chosen.
+func (p *Proxy) egressFor(target string) egress {
+	if p.bypass.matches(target) {
+		return egress{bypass: true}
+	}
+	return egress{upstream: p.upstream}
+}
+
+// proxyURL is the forward half of the single egress decision: the upstream URL
+// when one is configured, nil for a direct dial of the request's target.
+func (p *Proxy) proxyURL(r *http.Request) (*url.URL, error) {
+	chosen := p.egressFor(requestTarget(r))
+	if chosen.upstream == nil {
+		return nil, nil
+	}
+	return chosen.upstream.url, nil
+}
+
+// dialContext is the only function that opens outbound connections. Both a
+// direct target and the upstream address reach it, so tunnels and forwarded
+// requests share the egress decision and the dialler.
 func (p *Proxy) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	start := time.Now()
 	dialer := net.Dialer{Timeout: p.cfg.DialTimeout}
@@ -90,25 +177,27 @@ func (p *Proxy) dialContext(ctx context.Context, network, address string) (net.C
 }
 
 // reach opens the connection a CONNECT tunnel runs over. It is the tunnel half of
-// the single egress decision: the parsed upstream or a direct dial of the target.
+// the single egress decision: direct when the target is bypassed, otherwise the
+// parsed upstream or a direct dial of the target.
 func (p *Proxy) reach(ctx context.Context, target string) (net.Conn, error) {
-	if p.upstream == nil {
+	chosen := p.egressFor(target)
+	if chosen.upstream == nil {
 		return p.dialContext(ctx, "tcp", target)
 	}
-	return p.dialUpstream(ctx, target)
+	return p.dialUpstream(ctx, chosen.upstream, target)
 }
 
-// dialUpstream dials the configured upstream and asks it for a tunnel to target.
+// dialUpstream dials the upstream and asks it for a tunnel to target.
 // Any bytes the upstream sent after its status line stay readable from the
 // returned connection.
-func (p *Proxy) dialUpstream(ctx context.Context, target string) (net.Conn, error) {
+func (p *Proxy) dialUpstream(ctx context.Context, upstream *upstream, target string) (net.Conn, error) {
 	// One budget covers dialling and the CONNECT handshake together.
 	var deadline time.Time
 	if p.cfg.DialTimeout > 0 {
 		deadline = time.Now().Add(p.cfg.DialTimeout)
 	}
 
-	conn, err := p.dialContext(ctx, "tcp", p.upstream.addr)
+	conn, err := p.dialContext(ctx, "tcp", upstream.addr)
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +213,8 @@ func (p *Proxy) dialUpstream(ctx context.Context, target string) (net.Conn, erro
 	reader := bufio.NewReader(conn)
 	var request strings.Builder
 	fmt.Fprintf(&request, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	if p.upstream.authorization != "" {
-		fmt.Fprintf(&request, "Proxy-Authorization: %s\r\n", p.upstream.authorization)
+	if upstream.authorization != "" {
+		fmt.Fprintf(&request, "Proxy-Authorization: %s\r\n", upstream.authorization)
 	}
 	request.WriteString("\r\n")
 	if _, err := io.WriteString(conn, request.String()); err != nil {
@@ -198,10 +287,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential string) {
 	start := time.Now()
-	target := r.URL.Host
-	if target == "" {
-		target = r.Host
-	}
+	target := requestTarget(r)
+	chosen := p.egressFor(target)
 
 	var (
 		up      atomic.Int64
@@ -216,12 +303,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential strin
 			bytesDownTotal.Add(float64(down.Load()))
 		}
 		if failure != nil {
-			miso.Errorf("proxy request credential=%s target=%s up=%d down=%d duration=%s outcome=%s error=%v",
-				credential, target, up.Load(), down.Load(), time.Since(start), outcome, failure)
+			miso.Errorf("proxy request credential=%s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s error=%v",
+				credential, target, chosen.name(), chosen.bypass, up.Load(), down.Load(), time.Since(start), outcome, failure)
 			return
 		}
-		miso.Infof("proxy request credential=%s target=%s up=%d down=%d duration=%s outcome=%s",
-			credential, target, up.Load(), down.Load(), time.Since(start), outcome)
+		miso.Infof("proxy request credential=%s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
+			credential, target, chosen.name(), chosen.bypass, up.Load(), down.Load(), time.Since(start), outcome)
 	}()
 
 	if !r.URL.IsAbs() || r.URL.Scheme != "http" || r.URL.Host == "" {
@@ -253,7 +340,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential strin
 	// A 407 from a configured upstream rejects homeproxy's own credentials, not
 	// the client's: it must not masquerade as the client's auth challenge. The
 	// tunnel path already treats it as a gateway failure.
-	if p.upstream != nil && resp.StatusCode == http.StatusProxyAuthRequired {
+	if chosen.upstream != nil && resp.StatusCode == http.StatusProxyAuthRequired {
 		resp.Body.Close()
 		failure = fmt.Errorf("upstream rejected credentials: %s", resp.Status)
 		outcome = strconv.Itoa(http.StatusBadGateway)
@@ -416,6 +503,7 @@ func (p *Proxy) authenticate(r *http.Request) authentication {
 
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, credential string) {
 	start := time.Now()
+	chosen := p.egressFor(r.Host)
 	var (
 		up      int64
 		down    int64
@@ -425,15 +513,15 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, credential string
 	target, err := p.reach(r.Context(), r.Host)
 	if err != nil {
 		// Still on the normal HTTP path: report the failure without opening a tunnel.
-		miso.Errorf("proxy dial failed credential=%s target=%s duration=%s outcome=dial-failed error=%v",
-			credential, r.Host, time.Since(start), err)
+		miso.Errorf("proxy dial failed credential=%s target=%s egress=%s bypass=%t duration=%s outcome=dial-failed error=%v",
+			credential, r.Host, chosen.name(), chosen.bypass, time.Since(start), err)
 		writeStatus(w, http.StatusBadGateway)
 		return
 	}
 	defer target.Close()
 	defer func() {
-		miso.Infof("proxy tunnel credential=%s target=%s up=%d down=%d duration=%s outcome=%s",
-			credential, r.Host, up, down, time.Since(start), outcome)
+		miso.Infof("proxy tunnel credential=%s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
+			credential, r.Host, chosen.name(), chosen.bypass, up, down, time.Since(start), outcome)
 	}()
 
 	hijacker, ok := w.(http.Hijacker)
