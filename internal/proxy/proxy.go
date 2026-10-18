@@ -12,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/curtisnewbie/homeproxy/internal/config"
@@ -77,8 +79,14 @@ func (p *Proxy) proxyURL(*http.Request) (*url.URL, error) {
 // configured, the target otherwise), so tunnels and forwarded requests share
 // both the egress decision and the dialler.
 func (p *Proxy) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	start := time.Now()
 	dialer := net.Dialer{Timeout: p.cfg.DialTimeout}
-	return dialer.DialContext(ctx, network, address)
+	conn, err := dialer.DialContext(ctx, network, address)
+	dialDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
+		dialFailuresTotal.Inc()
+	}
+	return conn, err
 }
 
 // reach opens the connection a CONNECT tunnel runs over. It is the tunnel half of
@@ -171,21 +179,53 @@ func Serve(ln net.Listener, cfg config.Config) *http.Server {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !p.authorized(r) {
+	requestsTotal.Inc()
+	auth := p.authenticate(r)
+	if !auth.ok {
+		authFailuresTotal.Inc()
+		miso.Warnf("proxy auth failed remote=%s name=%q", r.RemoteAddr, auth.attempted)
 		writeAuthChallenge(w)
 		return
 	}
 
 	if r.Method == http.MethodConnect {
-		p.tunnel(w, r)
+		p.tunnel(w, r, auth.name)
 		return
 	}
 
-	p.forward(w, r)
+	p.forward(w, r, auth.name)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential string) {
+	start := time.Now()
+	target := r.URL.Host
+	if target == "" {
+		target = r.Host
+	}
+
+	var (
+		up      atomic.Int64
+		down    atomic.Int64
+		counted bool
+		outcome string
+		failure error
+	)
+	defer func() {
+		if counted {
+			bytesUpTotal.Add(float64(up.Load()))
+			bytesDownTotal.Add(float64(down.Load()))
+		}
+		if failure != nil {
+			miso.Errorf("proxy request credential=%s target=%s up=%d down=%d duration=%s outcome=%s error=%v",
+				credential, target, up.Load(), down.Load(), time.Since(start), outcome, failure)
+			return
+		}
+		miso.Infof("proxy request credential=%s target=%s up=%d down=%d duration=%s outcome=%s",
+			credential, target, up.Load(), down.Load(), time.Since(start), outcome)
+	}()
+
 	if !r.URL.IsAbs() || r.URL.Scheme != "http" || r.URL.Host == "" {
+		outcome = strconv.Itoa(http.StatusBadRequest)
 		writeStatus(w, http.StatusBadRequest)
 		return
 	}
@@ -194,34 +234,66 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	outreq.RequestURI = ""
 	outreq.Host = r.URL.Host
 	stripHopByHop(outreq.Header)
+	if outreq.Body != nil {
+		outreq.Body = &countingBody{ReadCloser: outreq.Body, count: &up}
+	}
 
 	resp, err := p.transport.RoundTrip(outreq)
+	// The transport may have read the request body even when it failed, and a
+	// failed RoundTrip still attempted a dial, so these bytes belong to the request.
+	counted = true
 	if err != nil {
 		// The failure belongs to this request: report it and keep serving.
-		miso.Errorf("proxy cannot forward to %s: %v", r.URL.Host, err)
+		failure = err
+		outcome = strconv.Itoa(http.StatusBadGateway)
 		writeStatus(w, http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
 
 	// A 407 from a configured upstream rejects homeproxy's own credentials, not
 	// the client's: it must not masquerade as the client's auth challenge. The
 	// tunnel path already treats it as a gateway failure.
 	if p.upstream != nil && resp.StatusCode == http.StatusProxyAuthRequired {
-		miso.Errorf("upstream rejected credentials for %s: %s", r.URL.Host, resp.Status)
+		resp.Body.Close()
+		failure = fmt.Errorf("upstream rejected credentials: %s", resp.Status)
+		outcome = strconv.Itoa(http.StatusBadGateway)
 		writeStatus(w, http.StatusBadGateway)
 		return
 	}
 
+	resp.Body = &countingBody{ReadCloser: resp.Body, count: &down}
+	defer resp.Body.Close()
+
 	stripHopByHop(resp.Header)
 	copyHeader(w.Header(), resp.Header)
+	outcome = strconv.Itoa(resp.StatusCode)
 	w.WriteHeader(resp.StatusCode)
-	streamBody(w, resp.Body)
+	if err := streamBody(w, resp.Body); err != nil {
+		outcome = "aborted"
+		failure = err
+		// The headers are already sent, so the only honest signal left is to abort
+		// the connection instead of ending the body as if it were complete.
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// countingBody records how many bytes were read through it, so a forwarded
+// request and response report the bytes that actually crossed the wire.
+type countingBody struct {
+	io.ReadCloser
+	count *atomic.Int64
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.count.Add(int64(n))
+	return n, err
 }
 
 // streamBody copies the response as it arrives and flushes after every chunk, so a
-// slow target is delivered incrementally rather than buffered to completion.
-func streamBody(w http.ResponseWriter, body io.Reader) {
+// slow target is delivered incrementally rather than buffered to completion. It
+// returns the read, write or flush failure that stopped the stream.
+func streamBody(w http.ResponseWriter, body io.Reader) error {
 	controller := http.NewResponseController(w)
 	buf := make([]byte, 32*1024)
 	for {
@@ -229,21 +301,19 @@ func streamBody(w http.ResponseWriter, body io.Reader) {
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				// The client is gone; there is nobody left to answer.
-				return
+				return writeErr
 			}
 			if err := controller.Flush(); err != nil {
-				return
+				return err
 			}
 		}
 		if readErr == nil {
 			continue
 		}
 		if errors.Is(readErr, io.EOF) {
-			return
+			return nil
 		}
-		// The headers are already sent, so the only honest signal left is to abort
-		// the connection instead of ending the body as if it were complete.
-		panic(http.ErrAbortHandler)
+		return readErr
 	}
 }
 
@@ -294,24 +364,34 @@ func writeStatus(w http.ResponseWriter, status int) {
 	w.WriteHeader(status)
 }
 
-// authorized reports whether the request carries a configured credential. Missing,
-// malformed, unknown-name and wrong-secret credentials all take the same false path;
-// names and secrets are compared as fixed-size digests in constant time so the
-// rejection never reveals which part was wrong.
-func (p *Proxy) authorized(r *http.Request) bool {
+// authentication is the outcome of one Proxy-Authorization attempt. attempted
+// always carries the decoded name part when the header decodes, so an auth
+// failure can name who tried; name is only set for a successful match.
+type authentication struct {
+	name      string
+	attempted string
+	ok        bool
+}
+
+// authenticate reports whether the request carries a configured credential.
+// Missing, malformed, unknown-name and wrong-secret credentials all take the same
+// false path; names and secrets are compared as fixed-size digests in constant
+// time so the rejection never reveals which part was wrong.
+func (p *Proxy) authenticate(r *http.Request) authentication {
 	header := r.Header.Get("Proxy-Authorization")
 	if len(header) < len(basicAuthPrefix) || !strings.EqualFold(header[:len(basicAuthPrefix)], basicAuthPrefix) {
-		return false
+		return authentication{}
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(basicAuthPrefix):]))
 	if err != nil {
-		return false
+		return authentication{}
 	}
 	name, secret, ok := strings.Cut(string(decoded), ":")
 	if !ok {
-		return false
+		return authentication{}
 	}
+	auth := authentication{attempted: name}
 
 	nameDigest := sha256.Sum256([]byte(name))
 	secretDigest := sha256.Sum256([]byte(secret))
@@ -321,51 +401,78 @@ func (p *Proxy) authorized(r *http.Request) bool {
 		credentialSecret := sha256.Sum256([]byte(credential.Secret))
 		nameMatches := subtle.ConstantTimeCompare(nameDigest[:], credentialName[:])
 		secretMatches := subtle.ConstantTimeCompare(secretDigest[:], credentialSecret[:])
-		matched |= nameMatches & secretMatches
+		hit := nameMatches & secretMatches
+		if hit == 1 {
+			auth.name = credential.Name
+		}
+		matched |= hit
 	}
-	return matched == 1
+	auth.ok = matched == 1
+	if !auth.ok {
+		auth.name = ""
+	}
+	return auth
 }
 
-func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, credential string) {
+	start := time.Now()
+	var (
+		up      int64
+		down    int64
+		outcome = "ok"
+	)
+
 	target, err := p.reach(r.Context(), r.Host)
 	if err != nil {
 		// Still on the normal HTTP path: report the failure without opening a tunnel.
-		miso.Errorf("proxy cannot reach %s: %v", r.Host, err)
+		miso.Errorf("proxy dial failed credential=%s target=%s duration=%s outcome=dial-failed error=%v",
+			credential, r.Host, time.Since(start), err)
 		writeStatus(w, http.StatusBadGateway)
 		return
 	}
 	defer target.Close()
+	defer func() {
+		miso.Infof("proxy tunnel credential=%s target=%s up=%d down=%d duration=%s outcome=%s",
+			credential, r.Host, up, down, time.Since(start), outcome)
+	}()
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		outcome = "hijack-failed"
 		http.Error(w, "proxy does not support hijacking", http.StatusInternalServerError)
 		return
 	}
 	client, clientBuffer, err := hijacker.Hijack()
 	if err != nil {
+		outcome = "hijack-failed"
 		return
 	}
 	defer client.Close()
 
 	if _, err := clientBuffer.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		outcome = "handshake-failed"
 		return
 	}
 	if err := clientBuffer.Flush(); err != nil {
+		outcome = "handshake-failed"
 		return
 	}
+
+	tunnelsActive.Inc()
+	defer tunnelsActive.Dec()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(target, clientBuffer.Reader)
+		up, _ = io.Copy(target, clientBuffer.Reader)
 		// The client finished sending: signal EOF to the target but keep reading the
 		// reverse direction so a half-closed request can still receive its response.
 		closeWrite(target)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(client, target)
+		down, _ = io.Copy(client, target)
 		// The target ended, so no bytes can flow back to the client any more. Close
 		// the client fully: this unblocks the surviving client->target copy instead of
 		// leaving it parked on a read that will never finish. A client that only
@@ -374,6 +481,9 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		_ = client.Close()
 	}()
 	wg.Wait()
+
+	bytesUpTotal.Add(float64(up))
+	bytesDownTotal.Add(float64(down))
 }
 
 type closeWriter interface {

@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/curtisnewbie/homeproxy/internal/config"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 const (
@@ -1635,6 +1637,239 @@ func writeConnect(t *testing.T, conn net.Conn, target, auth string) {
 	if _, err := io.WriteString(conn, request.String()); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
+}
+
+func metricFamily(t *testing.T, name string) *dto.MetricFamily {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() == name {
+			return family
+		}
+	}
+	t.Fatalf("metric %q is not exposed by prometheus.DefaultGatherer", name)
+	return nil
+}
+
+func singleMetric(t *testing.T, name string) *dto.Metric {
+	t.Helper()
+
+	metrics := metricFamily(t, name).GetMetric()
+	if len(metrics) != 1 {
+		t.Fatalf("metric %q has %d samples, want 1", name, len(metrics))
+	}
+	return metrics[0]
+}
+
+func counterValue(t *testing.T, name string) float64 {
+	t.Helper()
+	return singleMetric(t, name).GetCounter().GetValue()
+}
+
+func gaugeValue(t *testing.T, name string) float64 {
+	t.Helper()
+	return singleMetric(t, name).GetGauge().GetValue()
+}
+
+func histogramCount(t *testing.T, name string) uint64 {
+	t.Helper()
+	return singleMetric(t, name).GetHistogram().GetSampleCount()
+}
+
+func waitForCounter(t *testing.T, name string, cond func(float64) bool) float64 {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := counterValue(t, name)
+		if cond(got) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %v, condition not met within 5s", name, got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForGauge(t *testing.T, name string, cond func(float64) bool) float64 {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := gaugeValue(t, name)
+		if cond(got) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %v, condition not met within 5s", name, got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForHistogramCount(t *testing.T, name string, cond func(uint64) bool) uint64 {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := histogramCount(t, name)
+		if cond(got) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s sample count = %d, condition not met within 5s", name, got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestProxyCountsRequestsAndAuthFailures(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	authBefore := counterValue(t, "homeproxy_auth_failures_total")
+	requestsBefore := counterValue(t, "homeproxy_requests_total")
+
+	conn := dialProxy(t, addr)
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, _ := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d", status, http.StatusProxyAuthRequired)
+	}
+
+	waitForCounter(t, "homeproxy_auth_failures_total", func(v float64) bool { return v >= authBefore+1 })
+	waitForCounter(t, "homeproxy_requests_total", func(v float64) bool { return v >= requestsBefore+1 })
+
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("target accepted %d connection(s), want 0", n)
+	}
+}
+
+func TestProxyTracksActiveTunnels(t *testing.T) {
+	targetAddr := startEchoTarget(t)
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	baseline := gaugeValue(t, "homeproxy_tunnels_active")
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	waitForGauge(t, "homeproxy_tunnels_active", func(v float64) bool { return v == baseline+1 })
+
+	_ = tunnel.Close()
+	waitForGauge(t, "homeproxy_tunnels_active", func(v float64) bool { return v == baseline })
+}
+
+func TestProxyCountsTunnelBytes(t *testing.T) {
+	const payload = "bytes that cross the tunnel in both directions"
+
+	targetAddr := startEchoTarget(t)
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	upBefore := counterValue(t, "homeproxy_bytes_up_total")
+	downBefore := counterValue(t, "homeproxy_bytes_down_total")
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	if _, err := io.WriteString(tunnel, payload); err != nil {
+		t.Fatalf("write tunnel payload: %v", err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(tunnel, echo); err != nil {
+		t.Fatalf("read tunnel echo: %v", err)
+	}
+	if string(echo) != payload {
+		t.Fatalf("echo = %q, want %q", echo, payload)
+	}
+	_ = tunnel.Close()
+
+	size := float64(len(payload))
+	waitForCounter(t, "homeproxy_bytes_up_total", func(v float64) bool { return v >= upBefore+size })
+	waitForCounter(t, "homeproxy_bytes_down_total", func(v float64) bool { return v >= downBefore+size })
+
+	if got := counterValue(t, "homeproxy_bytes_up_total"); got != upBefore+size {
+		t.Errorf("homeproxy_bytes_up_total = %v, want %v", got, upBefore+size)
+	}
+	if got := counterValue(t, "homeproxy_bytes_down_total"); got != downBefore+size {
+		t.Errorf("homeproxy_bytes_down_total = %v, want %v", got, downBefore+size)
+	}
+}
+
+func TestProxyCountsForwardedRequestAndResponseBytes(t *testing.T) {
+	const body = `{"message":"a forwarded body that comes back unchanged"}`
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(w, r.Body)
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	upBefore := counterValue(t, "homeproxy_bytes_up_total")
+	downBefore := counterValue(t, "homeproxy_bytes_down_total")
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodPost, target.URL+"/echo",
+		basicAuth(testCredentialName, testCredentialSecret),
+		map[string]string{"Content-Type": "application/json"}, body)
+
+	resp := readProxyResponse(t, conn, http.MethodPost)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	echo, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(echo) != body {
+		t.Fatalf("echoed body = %q, want %q", echo, body)
+	}
+
+	size := float64(len(body))
+	waitForCounter(t, "homeproxy_bytes_up_total", func(v float64) bool { return v >= upBefore+size })
+	waitForCounter(t, "homeproxy_bytes_down_total", func(v float64) bool { return v >= downBefore+size })
+
+	if got := counterValue(t, "homeproxy_bytes_up_total"); got != upBefore+size {
+		t.Errorf("homeproxy_bytes_up_total = %v, want %v", got, upBefore+size)
+	}
+	if got := counterValue(t, "homeproxy_bytes_down_total"); got != downBefore+size {
+		t.Errorf("homeproxy_bytes_down_total = %v, want %v", got, downBefore+size)
+	}
+}
+
+func TestProxyCountsDialFailures(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve dead target: %v", err)
+	}
+	deadAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+	before := counterValue(t, "homeproxy_dial_failures_total")
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, deadAddr, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, _ := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadGateway)
+	}
+
+	waitForCounter(t, "homeproxy_dial_failures_total", func(v float64) bool { return v >= before+1 })
+}
+
+func TestProxyObservesDialDuration(t *testing.T) {
+	targetAddr := startEchoTarget(t)
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	before := histogramCount(t, "homeproxy_dial_duration")
+
+	tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	_ = tunnel.Close()
+
+	waitForHistogramCount(t, "homeproxy_dial_duration", func(v uint64) bool { return v > before })
 }
 
 func readResponseHead(t *testing.T, br *bufio.Reader) (string, int, http.Header) {
