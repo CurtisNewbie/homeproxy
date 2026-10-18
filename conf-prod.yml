@@ -1,0 +1,31 @@
+app:
+  name: homeproxy
+
+server:
+  port: 7990
+
+consul:
+  enabled: false
+
+metrics:
+  enabled: true
+
+homeproxy:
+  port: 17890
+  dial-timeout-seconds: 10
+  # String props are expanded from the environment by miso: ${VAR} or
+  # ${VAR:default}. Unset variables expand to the empty default, which means
+  # "dial the target directly" for the upstream and no upstream credentials.
+  upstream: "${HOMEPROXY_UPSTREAM:}"
+  upstream.username: "${HOMEPROXY_UPSTREAM_USERNAME:}"
+  upstream.password: "${HOMEPROXY_UPSTREAM_PASSWORD:}"
+  # List props are NOT expanded from ${ENV}; entries are literal. Exact host or
+  # *.suffix; hosts listed here bypass the upstream and are exempt from the
+  # private-network guard.
+  bypass: []
+  # List props are NOT expanded from ${ENV} either: the name and secret below
+  # are literal values. Replace the placeholder with a long random secret per
+  # device before deploying, or mount your own config over /conf/conf.yml.
+  users:
+    - name: phone
+      secret: replace-with-a-long-random-secret

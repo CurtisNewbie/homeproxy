@@ -25,7 +25,7 @@ const (
 	// misoconfig-prop: Password for authenticating against the upstream proxy
 	propUpstreamPassword = "homeproxy.upstream.password"
 
-	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-address guard; exact host or *.suffix
+	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host or *.suffix
 	propBypass = "homeproxy.bypass"
 
 	// misoconfig-prop: Timeout in seconds for dialling a target or upstream, including the upstream CONNECT handshake | 10
