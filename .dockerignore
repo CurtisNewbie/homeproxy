@@ -1,0 +1,11 @@
+.git
+.gitignore
+.scratch
+docs
+doc
+*.md
+!README.md
+homeproxy
+*.test
+*.out
+.env
