@@ -26,6 +26,14 @@ go test ./...
 
 Issues and specs live as local markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
 
+### Triage labels
+
+Default five-role vocabulary. See `docs/agents/triage-labels.md`.
+
 ### Domain docs
 
 Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
+
+### Code review
+
+Read before writing and when reviewing code. See `docs/agents/code-review.md`.
