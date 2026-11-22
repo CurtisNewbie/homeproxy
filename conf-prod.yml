@@ -23,6 +23,13 @@ homeproxy:
   # *.suffix; hosts listed here bypass the upstream and are exempt from the
   # private-network guard.
   bypass: []
+  # List props are NOT expanded from ${ENV}; entries are literal. Client
+  # addresses listed here use the proxy without a credential — an IPv4/IPv6
+  # address or a CIDR. Trust replaces the credential only: the private-network
+  # guard still applies. Keep the entries to networks you control, because every
+  # device on one of them gets access.
+  # trusted-clients: ["192.168.31.0/24"]
+  trusted-clients: []
   # List props are NOT expanded from ${ENV} either: the name and secret below
   # are literal values. Replace the placeholder with a long random secret per
   # device before deploying, or mount your own config over /conf/conf.yml.

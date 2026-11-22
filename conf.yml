@@ -15,6 +15,11 @@ homeproxy:
   # upstream: "127.0.0.1:7897"
   dial-timeout-seconds: 10
   bypass: []
+  # Client addresses that use the proxy without a credential: an IPv4/IPv6
+  # address or a CIDR. Trust replaces the credential only — the private-network
+  # guard still applies, so a private target still needs a bypass entry.
+  # trusted-clients: ["192.168.31.0/24"]
+  trusted-clients: []
   users:
     - name: phone
       secret: change-me
