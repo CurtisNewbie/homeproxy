@@ -116,7 +116,7 @@ request. Point it at the generated file:
   reached directly by the phone.
 
 The PAC direct list is **not** `homeproxy.bypass`. Bypass decides homeproxy's own egress; the PAC
-list decides the phone's. A host reachable only from the home network — `curtisnewbie.com` in the
+list decides the phone's. A host reachable only from the home network — `nas.home.arpa` in the
 sample — must stay off the PAC direct list, or the phone tries it directly and fails whenever it is
 away from home.
 

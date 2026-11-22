@@ -30,7 +30,7 @@ operator did not ask for.
 
 The PAC direct list is separate from `homeproxy.bypass`. Bypass decides homeproxy's own egress, a
 decision made at the server; the PAC list decides the client's, made on the phone. Reusing one list
-would send `curtisnewbie.com` — reachable only from the home network — down the direct path from a
+would send `nas.home.arpa` — reachable only from the home network — down the direct path from a
 phone that is anywhere else.
 
 The generated script uses plain string comparisons and no `shExpMatch`, `dnsResolve`, `isInNet`, or
