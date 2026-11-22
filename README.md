@@ -63,7 +63,8 @@ Every key the service reads is documented in one table, generated from the confi
 `misoconfig -path doc/config.md`; do not edit the generated table by hand. Config is read once at
 startup; rotating a credential or changing the upstream means editing the file and restarting.
 
-`${VAR}` / `${VAR:default}` expansion applies **only to string props** — `homeproxy.upstream`,
+`${VAR}` / `${VAR:default}` expansion applies **only to string props** —
+`homeproxy.upstream.address` (and the deprecated alias `homeproxy.upstream`),
 `homeproxy.upstream.username`, `homeproxy.upstream.password` — because those are read as strings,
 and miso expands the placeholder when it reads a string prop. List props (`homeproxy.users`,
 `homeproxy.bypass`, `homeproxy.pac.direct`, `homeproxy.pac.proxy-hosts`), numeric props

@@ -62,6 +62,12 @@ func New(cfg config.Config) *Proxy {
 	if key, ignored := p.pac.ignoredList(); ignored {
 		miso.Warnf("%s has entries but homeproxy.pac.mode is %s: the list is ignored", key, p.pac.mode)
 	}
+	// Only an upstream that exists can be dead; without one, egress pac changes
+	// nothing to warn about.
+	if cfg.Upstream != "" && cfg.UpstreamEgress == config.UpstreamEgressPAC &&
+		p.pac.mode == config.PACModeDirect && p.pac.proxyHosts.empty() {
+		miso.Warnf("homeproxy.upstream.egress is pac but homeproxy.pac.mode is direct and homeproxy.pac.proxy-hosts is empty: the upstream can never be used")
+	}
 	if cfg.Upstream != "" {
 		p.upstream = &upstream{
 			addr: cfg.Upstream,
@@ -139,8 +145,9 @@ func (b bypassList) empty() bool {
 
 // pacCacheLifetime bounds how long a client may reuse a PAC it already fetched.
 // CFNetwork reads only Expires and otherwise caches for 24 hours, so this is the
-// whole cache policy.
-const pacCacheLifetime = 5 * time.Minute
+// whole cache policy. Keep it short: a stale file keeps routing by an old host
+// list for its whole lifetime.
+const pacCacheLifetime = time.Minute
 
 // pac renders the Proxy Auto-Configuration file served at /proxy.pac. Only the
 // mode's own list is consulted; the other is parsed but never emitted.
@@ -165,6 +172,16 @@ func (p pac) ignoredList() (string, bool) {
 		return config.KeyPACProxyHosts, !p.proxyHosts.empty()
 	}
 	return config.KeyPACDirect, !p.direct.empty()
+}
+
+// proxies reports whether the PAC file routes target through the proxy. It
+// mirrors script exactly: the active mode's own list decides, and a listed entry
+// is what the mode assigns to the proxy.
+func (p pac) proxies(target string) bool {
+	if p.mode == config.PACModeProxy {
+		return !p.direct.matches(target)
+	}
+	return p.proxyHosts.matches(target)
 }
 
 // script renders the file for one proxy token. The entries were validated at
@@ -330,12 +347,24 @@ func (p *Proxy) egressFor(ctx context.Context, target string) egress {
 	}
 	addresses, err := p.resolver.resolve(resolveCtx, host)
 	if err != nil {
+		// Without an upstream a failed lookup leaves nothing to dial. With
+		// egress pac, a PAC-direct target is in the same position even when an
+		// upstream exists, because that upstream is not for this target.
+		if p.cfg.UpstreamEgress == config.UpstreamEgressPAC && !p.pac.proxies(target) {
+			return egress{lookupFailure: err}
+		}
 		return egress{upstream: p.upstream, lookupFailure: err}
 	}
 	for _, address := range addresses {
 		if nonPublic(address.IP) {
 			return egress{refusal: fmt.Errorf("%w: %s resolves to %s", errGuardRefused, host, address.IP)}
 		}
+	}
+	// The guard has vetted the addresses. Egress pac keeps the upstream only for
+	// the targets the PAC routes through the proxy; the rest use the direct egress
+	// at these same addresses.
+	if p.cfg.UpstreamEgress == config.UpstreamEgressPAC && !p.pac.proxies(target) {
+		return egress{addresses: addresses}
 	}
 	return egress{upstream: p.upstream, addresses: addresses}
 }

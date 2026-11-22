@@ -19,9 +19,13 @@ homeproxy:
   # String props are expanded from the environment by miso: ${VAR} or
   # ${VAR:default}. Unset variables expand to the empty default, which means
   # "dial the target directly" for the upstream and no upstream credentials.
-  upstream: "${HOMEPROXY_UPSTREAM:}"
-  upstream.username: "${HOMEPROXY_UPSTREAM_USERNAME:}"
-  upstream.password: "${HOMEPROXY_UPSTREAM_PASSWORD:}"
+  upstream:
+    address: "${HOMEPROXY_UPSTREAM:}"
+    username: "${HOMEPROXY_UPSTREAM_USERNAME:}"
+    password: "${HOMEPROXY_UPSTREAM_PASSWORD:}"
+    # What the upstream carries: all sends every target that is not in bypass
+    # to it; pac sends only the hosts the PAC file routes through the proxy.
+    egress: all
   # Exact host or *.suffix; hosts listed here bypass the upstream and are exempt
   # from the private-network guard.
   bypass: []

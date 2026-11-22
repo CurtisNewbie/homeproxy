@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/curtisnewbie/miso/miso"
 )
 
 func validTestConfig() Config {
@@ -125,6 +127,119 @@ func TestValidatePACMode(t *testing.T) {
 		if !strings.Contains(err.Error(), "homeproxy.pac.mode") || !strings.Contains(err.Error(), fmt.Sprintf("%q", value)) {
 			t.Errorf("error for %q does not name the key and the value: %v", value, err)
 		}
+	}
+}
+
+func TestValidateUpstreamEgress(t *testing.T) {
+	for _, value := range []string{UpstreamEgressAll, UpstreamEgressPAC, "", " PAC "} {
+		cfg := validTestConfig()
+		cfg.UpstreamEgress = value
+		if err := cfg.validate(); err != nil {
+			t.Errorf("homeproxy.upstream.egress %q rejected: %v", value, err)
+			continue
+		}
+		want := strings.ToLower(strings.TrimSpace(value))
+		if want == "" {
+			want = UpstreamEgressAll
+		}
+		if cfg.UpstreamEgress != want {
+			t.Errorf("homeproxy.upstream.egress after validate = %q, want %q", cfg.UpstreamEgress, want)
+		}
+	}
+
+	for _, value := range []string{"mixed", "proxied"} {
+		cfg := validTestConfig()
+		cfg.UpstreamEgress = value
+		err := cfg.validate()
+		if err == nil {
+			t.Errorf("homeproxy.upstream.egress %q accepted", value)
+			continue
+		}
+		if !strings.Contains(err.Error(), "homeproxy.upstream.egress") || !strings.Contains(err.Error(), fmt.Sprintf("%q", value)) {
+			t.Errorf("error for %q does not name the key and the value: %v", value, err)
+		}
+		for _, accepted := range []string{UpstreamEgressAll, UpstreamEgressPAC} {
+			if !strings.Contains(err.Error(), fmt.Sprintf("%q", accepted)) {
+				t.Errorf("error for %q does not name %q: %v", value, accepted, err)
+			}
+		}
+	}
+}
+
+func TestLoadUpstreamAddressPrecedence(t *testing.T) {
+	// Load validates the whole Config, so every fixture carries the minimum
+	// authorization and leaves ports at their registered defaults.
+	const authorization = `  trusted-clients: ["127.0.0.1"]`
+	tests := []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{
+			name: "nested address only",
+			config: `homeproxy:
+  upstream:
+    address: "nested.example:8080"
+` + authorization,
+			want: "nested.example:8080",
+		},
+		{
+			name: "deprecated scalar only",
+			config: `homeproxy:
+  upstream: "scalar.example:8080"
+` + authorization,
+			want: "scalar.example:8080",
+		},
+		{
+			// A YAML key cannot be both a scalar and a block, so no real file
+			// holds both forms literally. The dotted key is a fixture-only way
+			// to set both and exercise the precedence rule.
+			name: "nested address wins over deprecated scalar",
+			config: `homeproxy:
+  upstream: "scalar.example:8080"
+  upstream.address: "nested.example:8080"
+` + authorization,
+			want: "nested.example:8080",
+		},
+		{
+			name: "neither leaves an empty address",
+			config: `homeproxy:
+` + authorization,
+			want: "",
+		},
+		{
+			name: "nested address is trimmed",
+			config: `homeproxy:
+  upstream:
+    address: "  spaced.example:8080  "
+` + authorization,
+			want: "spaced.example:8080",
+		},
+		{
+			name: "deprecated scalar is trimmed",
+			config: `homeproxy:
+  upstream: "  spaced.example:8080  "
+` + authorization,
+			want: "spaced.example:8080",
+		},
+	}
+
+	// Reload replaces the whole config, so cases cannot leak into each other.
+	t.Cleanup(func() { _ = miso.ReloadConfigFromStr("{}") })
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := miso.ReloadConfigFromStr(tt.config); err != nil {
+				t.Fatalf("reload config: %v", err)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.Upstream != tt.want {
+				t.Errorf("Upstream = %q, want %q", cfg.Upstream, tt.want)
+			}
+		})
 	}
 }
 

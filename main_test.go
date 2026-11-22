@@ -742,6 +742,41 @@ func TestProcessDoesNotWarnWhenInactivePACListIsEmpty(t *testing.T) {
 	}
 }
 
+func TestProcessWarnsWhenUpstreamEgressPACHasNoProxiedHosts(t *testing.T) {
+	// Default direct mode with an empty proxy-hosts routes every target direct,
+	// so an upstream under egress pac is unreachable.
+	conf := validCredentialsConf + `  upstream:
+    address: "127.0.0.1:3128"
+    egress: pac
+`
+	app := startAppWithConf(t, conf)
+	app.waitUntilHealthy(t)
+
+	const warning = "homeproxy.upstream.egress is pac but homeproxy.pac.mode is direct and homeproxy.pac.proxy-hosts is empty: the upstream can never be used"
+	app.waitForLine(t, warning)
+	if n := strings.Count(app.output.String(), warning); n != 1 {
+		t.Errorf("upstream egress warning appeared %d time(s), want 1\noutput:\n%s", n, app.output.String())
+	}
+}
+
+func TestProcessWarnsForDeprecatedScalarUpstreamUnderEgressPAC(t *testing.T) {
+	// A YAML key cannot be both a scalar address and a nested block, so the
+	// dotted key is a fixture-only way to set egress beside the deprecated
+	// scalar; neither sample config uses it. Verified against a real file: the
+	// scalar address and egress pac both take effect.
+	conf := validCredentialsConf + `  upstream: "127.0.0.1:3128"
+  upstream.egress: pac
+`
+	app := startAppWithConf(t, conf)
+	app.waitUntilHealthy(t)
+
+	const warning = "homeproxy.upstream.egress is pac but homeproxy.pac.mode is direct and homeproxy.pac.proxy-hosts is empty: the upstream can never be used"
+	app.waitForLine(t, warning)
+	if n := strings.Count(app.output.String(), warning); n != 1 {
+		t.Errorf("upstream egress warning appeared %d time(s), want 1\noutput:\n%s", n, app.output.String())
+	}
+}
+
 func TestProcessAcceptsNormalizedPACDirectEntries(t *testing.T) {
 	conf := validCredentialsConf + `  pac:
     direct:

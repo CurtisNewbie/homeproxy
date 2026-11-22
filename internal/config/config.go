@@ -21,6 +21,9 @@ const (
 	propCredentials = "homeproxy.users"
 
 	// misoconfig-prop: Upstream proxy address (host:port); empty means direct connections
+	propUpstreamAddress = "homeproxy.upstream.address"
+
+	// misoconfig-prop: Deprecated alias for homeproxy.upstream.address, used only when that is empty
 	propUpstream = "homeproxy.upstream"
 
 	// misoconfig-prop: Username for authenticating against the upstream proxy
@@ -28,6 +31,9 @@ const (
 
 	// misoconfig-prop: Password for authenticating against the upstream proxy
 	propUpstreamPassword = "homeproxy.upstream.password"
+
+	// misoconfig-prop: What the upstream carries: all sends every non-bypass target to it, pac sends only the targets the PAC file routes through the proxy and dials the rest direct | all
+	propUpstreamEgress = "homeproxy.upstream.egress"
 
 	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host or *.suffix
 	propBypass = "homeproxy.bypass"
@@ -60,6 +66,7 @@ const (
 // misoconfig-default-start
 func init() {
 	miso.SetDefProp(propProxyPort, 17890)
+	miso.SetDefProp(propUpstreamEgress, "all")
 	miso.SetDefProp(propPACMode, "direct")
 	miso.SetDefProp(propPACRequireTrustedClient, true)
 	miso.SetDefProp(propDialTimeoutSeconds, 10)
@@ -74,6 +81,12 @@ const (
 	PACModeProxy  = "proxy"
 )
 
+// Egress choices for homeproxy.upstream.egress.
+const (
+	UpstreamEgressAll = "all"
+	UpstreamEgressPAC = "pac"
+)
+
 type Credential struct {
 	Name   string
 	Secret string
@@ -86,6 +99,7 @@ type Config struct {
 	Upstream                string
 	UpstreamUsername        string
 	UpstreamPassword        string
+	UpstreamEgress          string
 	Bypass                  []string
 	PACMode                 string
 	PACDirect               []string
@@ -97,13 +111,20 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	// The nested address wins; the old scalar homeproxy.upstream stays as a
+	// deprecated fallback for configs written before the nested block existed.
+	upstreamAddress := miso.GetPropStr(propUpstreamAddress)
+	if upstreamAddress == "" {
+		upstreamAddress = miso.GetPropStr(propUpstream)
+	}
 	cfg := Config{
 		ProxyPort:               miso.GetPropInt(propProxyPort),
 		ManagementPort:          miso.GetPropInt(propManagementPort),
 		Credentials:             miso.UnmarshalFromPropKeyAs[[]Credential](propCredentials),
-		Upstream:                miso.GetPropStr(propUpstream),
+		Upstream:                strings.TrimSpace(upstreamAddress),
 		UpstreamUsername:        miso.GetPropStr(propUpstreamUsername),
 		UpstreamPassword:        miso.GetPropStr(propUpstreamPassword),
+		UpstreamEgress:          miso.GetPropStr(propUpstreamEgress),
 		Bypass:                  miso.GetPropStrSlice(propBypass),
 		PACMode:                 miso.GetPropStr(propPACMode),
 		PACDirect:               miso.GetPropStrSlice(KeyPACDirect),
@@ -141,6 +162,15 @@ func (c *Config) validate() error {
 	c.PACMode = strings.ToLower(strings.TrimSpace(c.PACMode))
 	if c.PACMode != PACModeDirect && c.PACMode != PACModeProxy {
 		return fmt.Errorf("homeproxy.pac.mode %q must be %q or %q", c.PACMode, PACModeDirect, PACModeProxy)
+	}
+	c.UpstreamEgress = strings.ToLower(strings.TrimSpace(c.UpstreamEgress))
+	if c.UpstreamEgress == "" {
+		// The property default is all; an unset field in a hand-built Config
+		// means the same thing.
+		c.UpstreamEgress = UpstreamEgressAll
+	}
+	if c.UpstreamEgress != UpstreamEgressAll && c.UpstreamEgress != UpstreamEgressPAC {
+		return fmt.Errorf("homeproxy.upstream.egress %q must be %q or %q", c.UpstreamEgress, UpstreamEgressAll, UpstreamEgressPAC)
 	}
 	if err := validatePACEntries(KeyPACDirect, c.PACDirect); err != nil {
 		return err

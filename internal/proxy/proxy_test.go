@@ -1781,6 +1781,257 @@ func TestProxyBypassNonListedHostUsesUpstream(t *testing.T) {
 	}
 }
 
+// With egress all, the upstream carries every non-bypass target exactly as it
+// did before the egress setting existed.
+func TestProxyUpstreamEgressAllUsesUpstream(t *testing.T) {
+	targetAddr := startEchoTarget(t)
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressAll
+	addr := startTestProxyWithConfig(t, cfg)
+
+	publicTarget := publicTargetAuthority(t, targetAddr)
+	openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect || seen[0].authority != publicTarget {
+		t.Errorf("upstream observed %s %s, want CONNECT %s", seen[0].method, seen[0].authority, publicTarget)
+	}
+}
+
+// With egress pac and mode direct, a host listed in pac.proxy-hosts is routed
+// through the PAC, so the upstream carries it.
+func TestProxyUpstreamEgressPACDirectModeProxiedHostUsesUpstream(t *testing.T) {
+	targetAddr := startEchoTarget(t)
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"203.0.113.7"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	publicTarget := publicTargetAuthority(t, targetAddr)
+	openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect || seen[0].authority != publicTarget {
+		t.Errorf("upstream observed %s %s, want CONNECT %s", seen[0].method, seen[0].authority, publicTarget)
+	}
+}
+
+// With egress pac and mode direct, a host the PAC routes direct is dialled by
+// the proxy itself; the upstream sees no connection.
+func TestProxyUpstreamEgressPACDirectModeUnlistedHostDialsDirectly(t *testing.T) {
+	upstream := startFakeUpstream(t)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"listed.example.com"}
+	// TEST-NET-3 cannot be reached; the timeout bounds the direct dial so the
+	// 502 comes from the dial budget rather than the network's failure mode.
+	cfg.DialTimeout = 200 * time.Millisecond
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	const directTarget = "203.0.113.7:443"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, directTarget, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d, want %d from the direct dial (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+	_ = conn.Close()
+
+	if got := histogramCount(t, "homeproxy_dial_duration"); got != dialBefore+1 {
+		t.Errorf("recorded %d dial(s), want 1 direct dial", got-dialBefore)
+	}
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want nothing for a PAC-direct host", seen)
+	}
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0 for a PAC-direct host", n)
+	}
+}
+
+// With egress pac and mode proxy, a host in pac.direct is dialled by the proxy
+// and an unlisted host is handed to the upstream.
+func TestProxyUpstreamEgressPACProxyModeListedHostDialsDirectly(t *testing.T) {
+	upstream := startFakeUpstream(t)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeProxy
+	cfg.PACDirect = []string{"203.0.113.7"}
+	cfg.DialTimeout = 200 * time.Millisecond
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	const directTarget = "203.0.113.7:443"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, directTarget, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d, want %d from the direct dial (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+	_ = conn.Close()
+
+	if got := histogramCount(t, "homeproxy_dial_duration"); got != dialBefore+1 {
+		t.Errorf("recorded %d dial(s), want 1 direct dial", got-dialBefore)
+	}
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0 for a pac.direct host", n)
+	}
+}
+
+func TestProxyUpstreamEgressPACProxyModeUnlistedHostUsesUpstream(t *testing.T) {
+	targetAddr := startEchoTarget(t)
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeProxy
+	cfg.PACDirect = []string{"198.51.100.7"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	publicTarget := publicTargetAuthority(t, targetAddr)
+	openTunnel(t, addr, publicTarget, basicAuth(testCredentialName, testCredentialSecret))
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect || seen[0].authority != publicTarget {
+		t.Errorf("upstream observed %s %s, want CONNECT %s", seen[0].method, seen[0].authority, publicTarget)
+	}
+}
+
+// The private-network guard still runs before the egress is chosen: a PAC-direct
+// private target is refused and nothing is dialled.
+func TestProxyUpstreamEgressPACDirectPrivateTargetIsRefused(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+	upstream := startFakeUpstream(t)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"listed.example.com"}
+	cfg.Bypass = nil // the guard must run on this target
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusForbidden {
+		t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusForbidden, headers)
+	}
+	_ = conn.Close()
+
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("target accepted %d connection(s), want 0", n)
+	}
+	assertNoDial(t, dialBefore)
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0", n)
+	}
+}
+
+// A PAC-direct target that does not resolve has no upstream to hand it to, so
+// the request fails and nothing is dialled.
+func TestProxyUpstreamEgressPACDirectUnresolvedTargetFailsWithoutDialling(t *testing.T) {
+	upstream := startFakeUpstream(t)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"listed.example.com"}
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	// .invalid is reserved and never resolves.
+	const unresolvable = "does-not-exist.invalid:443"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, unresolvable, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusBadGateway, headers)
+	}
+	_ = conn.Close()
+
+	assertNoDial(t, dialBefore)
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0", n)
+	}
+}
+
+// homeproxy.bypass outranks the PAC policy: a bypass host takes the direct
+// egress whatever the PAC would say.
+func TestProxyUpstreamEgressPACBypassHostDialsDirectly(t *testing.T) {
+	tests := []struct {
+		name       string
+		proxyHosts []string
+	}{
+		{name: "PAC proxies the host", proxyHosts: []string{"127.0.0.1"}},
+		{name: "PAC routes the host direct", proxyHosts: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targetAddr := startEchoTarget(t)
+			targetHost, _, err := net.SplitHostPort(targetAddr)
+			if err != nil {
+				t.Fatalf("split target address: %v", err)
+			}
+			upstream := startFakeUpstream(t)
+
+			cfg := testProxyConfig()
+			cfg.Upstream = upstream.addr()
+			cfg.UpstreamEgress = config.UpstreamEgressPAC
+			cfg.PACMode = config.PACModeDirect
+			cfg.PACProxyHosts = tt.proxyHosts
+			cfg.Bypass = []string{targetHost}
+			addr := startTestProxyWithConfig(t, cfg)
+
+			const payload = "bypass beats the PAC policy"
+			tunnel := openTunnel(t, addr, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+			if _, err := io.WriteString(tunnel, payload); err != nil {
+				t.Fatalf("write tunnel payload: %v", err)
+			}
+			echo := make([]byte, len(payload))
+			if _, err := io.ReadFull(tunnel, echo); err != nil {
+				t.Fatalf("read tunnel echo: %v", err)
+			}
+			if string(echo) != payload {
+				t.Errorf("echo = %q, want %q", echo, payload)
+			}
+
+			if seen := upstream.seen(); len(seen) != 0 {
+				t.Errorf("upstream observed %+v, want the bypass host dialled directly", seen)
+			}
+		})
+	}
+}
+
 const pacContentType = "application/x-ns-proxy-autoconfig"
 
 func originFormGet(t *testing.T, addr, host, path, auth string) *http.Response {
@@ -1833,7 +2084,7 @@ func TestPACAnswersOriginFormGETWithoutCredential(t *testing.T) {
 		expires, err := http.ParseTime(got)
 		if err != nil {
 			t.Errorf("Expires = %q: %v", got, err)
-		} else if wait := time.Until(expires); wait <= 0 || wait > pacCacheLifetime+time.Minute {
+		} else if wait := time.Until(expires); wait <= 0 || wait > pacCacheLifetime+10*time.Second {
 			t.Errorf("Expires = %q is %s away, want about %s", got, wait, pacCacheLifetime)
 		}
 	} else {
