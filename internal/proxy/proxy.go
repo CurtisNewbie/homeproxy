@@ -559,6 +559,11 @@ func (p *Proxy) servePAC(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
 	w.Header().Set("Cache-Control", "no-store")
+	// CFNetwork ignores Cache-Control and honours only Expires, defaulting to a
+	// 24-hour cache when the header is absent: without this, a phone keeps
+	// evaluating the file it fetched yesterday and cannot be fixed by editing
+	// the config. A past date keeps the fetch fresh on every evaluation.
+	w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
 	// Info, so the box shows whether the client ever fetched the file: a PAC the
 	// client never loads and a PAC it loads but ignores look identical from the
 	// proxy, because neither produces a request log line.

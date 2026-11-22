@@ -1828,6 +1828,10 @@ func TestPACAnswersOriginFormGETWithoutCredential(t *testing.T) {
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
 	}
+	// CFNetwork caches a PAC for 24 hours unless Expires says otherwise.
+	if got := resp.Header.Get("Expires"); got != "Thu, 01 Jan 1970 00:00:00 GMT" {
+		t.Errorf("Expires = %q, want a date in the past", got)
+	}
 	body := readBody(t, resp)
 	if !strings.Contains(body, "function FindProxyForURL(url, host)") {
 		t.Errorf("body does not define FindProxyForURL:\n%s", body)
