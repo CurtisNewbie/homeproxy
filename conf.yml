@@ -11,7 +11,7 @@ consul:
   enabled: false
 
 metrics:
-  enabled: true
+  enabled: false
 
 homeproxy:
   port: 17890

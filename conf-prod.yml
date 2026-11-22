@@ -22,40 +22,43 @@ homeproxy:
   upstream: "${HOMEPROXY_UPSTREAM:}"
   upstream.username: "${HOMEPROXY_UPSTREAM_USERNAME:}"
   upstream.password: "${HOMEPROXY_UPSTREAM_PASSWORD:}"
-  # List props are NOT expanded from ${ENV}; entries are literal. Exact host or
-  # *.suffix; hosts listed here bypass the upstream and are exempt from the
-  # private-network guard.
+  # Exact host or *.suffix; hosts listed here bypass the upstream and are exempt
+  # from the private-network guard.
   bypass: []
-  # List props are NOT expanded from ${ENV}; entries are literal. Client
-  # addresses listed here use the proxy without a credential — an IPv4/IPv6
-  # address or a CIDR. Trust replaces the credential only: the private-network
-  # guard still applies. Keep the entries to networks you control, because every
-  # device on one of them gets access.
+  # Client addresses that use the proxy without a credential: an IPv4/IPv6
+  # address or a CIDR. Trust replaces the credential only — the private-network
+  # guard still applies, so a private target still needs a bypass entry.
+  # Every device on a listed network is trusted, so keep this to networks you
+  # control.
+  # This list and users cannot both be empty: without either, the service
+  # refuses to start.
   # trusted-clients: ["192.168.31.0/24"]
   trusted-clients: []
-  # The PAC file at GET /proxy.pac, for iOS Automatic mode. List props are
-  # literal. `mode: direct` sends only pac.proxy-hosts through the proxy and
-  # everything else direct; `mode: proxy` does the reverse, exempting pac.direct.
-  # `proxy` is the address the file names; empty derives it from the request Host
-  # and homeproxy.port.
-  pac.mode: direct
-  # pac.proxy-hosts: ["api.weibo.cn", "*.corp.internal"]
-  pac.proxy-hosts: []
-  # Used only when pac.mode is proxy.
-  # pac.direct: ["api.weibo.cn"]
-  pac.direct: []
-  # pac.proxy: "192.168.31.51:17890"
-  pac.proxy: ""
-  # Serve /proxy.pac only to addresses in trusted-clients. Requires a non-empty
-  # trusted-clients; with none, the file goes to nobody and startup warns. Set
-  # this to false to serve the file to any address that can reach the proxy port.
-  pac.require-trusted-client: true
-  # List props are NOT expanded from ${ENV} either: the name and secret below
-  # are literal values. Replace the placeholder with a long random secret per
-  # device before deploying, or mount your own config over /conf/conf.yml.
-  # This list is optional: a trusted client address authorizes on its own, so
-  # leave it out when trusted-clients covers every device that needs access.
-  # At least one of the two lists must be non-empty.
-  users:
-    - name: phone
-      secret: replace-with-a-long-random-secret
+
+  # The PAC file served at GET /proxy.pac, for iOS Automatic mode.
+  # mode: direct sends only proxy-hosts through the proxy and everything else
+  # direct; mode: proxy does the reverse, exempting direct. Only the active
+  # mode's list is read, and the other one logs a startup warning.
+  pac:
+    mode: direct
+    proxy-hosts:
+      - api.weibo.cn
+      - "*.corp.internal"
+    # Used only when pac.mode is proxy.
+    direct: []
+    # Address the file names as the proxy, as host:port. Empty derives it from
+    # the request Host and homeproxy.port, which is right when the client
+    # reaches the box on the same address it fetched the file from.
+    proxy: ""
+    # Serve /proxy.pac only to addresses in trusted-clients. Needs a non-empty
+    # trusted-clients; with none, the file goes to nobody and startup warns. Set
+    # this to false to serve the file to any address that can reach the proxy
+    # port.
+    require-trusted-client: true
+
+  # Basic auth credentials, one per device, as name/secret pairs. Optional: a
+  # trusted client address authorizes on its own. Uncomment and fill in when a
+  # device must be authorized by credential instead of by address.
+  # users:
+  #   - name: phone
+  #     secret: replace-with-a-long-random-secret
