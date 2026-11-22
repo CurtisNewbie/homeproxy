@@ -590,6 +590,57 @@ func TestProcessRejectsCredentialWithoutSecret(t *testing.T) {
 	}
 }
 
+func TestProcessRejectsMalformedTrustedClient(t *testing.T) {
+	proxyPort, managementPort := freePortPair(t)
+
+	output := runToExit(t, writeConf(t, proxyPort, managementPort, validCredentialsConf+`  trusted-clients:
+    - not-an-address
+`))
+
+	if !strings.Contains(output, "homeproxy.trusted-clients") {
+		t.Errorf("output does not name homeproxy.trusted-clients:\n%s", output)
+	}
+	if !strings.Contains(output, "not a valid address or CIDR") {
+		t.Errorf("output does not explain the problem:\n%s", output)
+	}
+}
+
+func TestProcessRejectsTrustingEveryAddress(t *testing.T) {
+	for _, entry := range []string{"0.0.0.0/0", "::/0", "::ffff:0:0/96"} {
+		t.Run(entry, func(t *testing.T) {
+			proxyPort, managementPort := freePortPair(t)
+
+			conf := validCredentialsConf + "  trusted-clients:\n    - " + entry + "\n"
+			output := runToExit(t, writeConf(t, proxyPort, managementPort, conf))
+
+			if !strings.Contains(output, "homeproxy.trusted-clients") {
+				t.Errorf("output does not name homeproxy.trusted-clients:\n%s", output)
+			}
+			if !strings.Contains(output, "must not trust every address") {
+				t.Errorf("output does not explain the problem:\n%s", output)
+			}
+		})
+	}
+}
+
+func TestProcessRejectsNarrowIPv4MappedTrustedClient(t *testing.T) {
+	proxyPort, managementPort := freePortPair(t)
+
+	const entry = "::ffff:10.0.0.0/8"
+	conf := validCredentialsConf + "  trusted-clients:\n    - " + entry + "\n"
+	output := runToExit(t, writeConf(t, proxyPort, managementPort, conf))
+
+	if !strings.Contains(output, "homeproxy.trusted-clients") {
+		t.Errorf("output does not name homeproxy.trusted-clients:\n%s", output)
+	}
+	if !strings.Contains(output, entry) {
+		t.Errorf("output does not name the rejected entry:\n%s", output)
+	}
+	if !strings.Contains(output, "narrower than /96") {
+		t.Errorf("output does not explain the problem:\n%s", output)
+	}
+}
+
 func TestProcessRejectsEqualPorts(t *testing.T) {
 	port := freePort(t)
 

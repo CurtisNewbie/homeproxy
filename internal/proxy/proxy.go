@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -45,12 +46,13 @@ type Proxy struct {
 	cfg       config.Config
 	upstream  *upstream
 	bypass    bypassList
+	trusted   trustedList
 	resolver  *resolver
 	transport *http.Transport
 }
 
 func New(cfg config.Config) *Proxy {
-	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), resolver: newResolver()}
+	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), trusted: newTrustedList(cfg.TrustedClients), resolver: newResolver()}
 	if cfg.Upstream != "" {
 		p.upstream = &upstream{
 			addr: cfg.Upstream,
@@ -133,6 +135,64 @@ func hostOnly(authority string) string {
 	authority = strings.TrimSuffix(authority, "]")
 	authority = strings.TrimSuffix(authority, ".")
 	return strings.ToLower(authority)
+}
+
+// trustedList is the parsed homeproxy.trusted-clients value, parsed once in New
+// so no request path re-reads or re-parses the configured strings.
+type trustedList []netip.Prefix
+
+func newTrustedList(entries []string) trustedList {
+	prefixes, err := config.ParseTrustedClients(entries)
+	if err != nil {
+		// Load validates the list before a Config reaches here; a hand-built
+		// Config with a bad entry trusts nothing.
+		miso.Warnf("homeproxy.trusted-clients ignored: %v", err)
+		return nil
+	}
+	return prefixes
+}
+
+// match reports whether remoteAddr belongs to a trusted client. It uses the
+// host part of the connection's address and nothing else: no header, no DNS. An
+// IPv4-mapped IPv6 address is unmapped so it matches an IPv4 entry.
+func (t trustedList) match(remoteAddr string) (netip.Addr, bool) {
+	addr, err := netip.ParseAddr(hostOnly(remoteAddr))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	addr = addr.WithZone("")
+	addr = addr.Unmap()
+	for _, prefix := range t {
+		if prefix.Contains(addr) {
+			return addr, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// clientIdentity is what a request log names: the credential that authorized the
+// request, or the trusted address that stood in for one.
+type clientIdentity struct {
+	credential string
+	trusted    bool
+}
+
+// logFields renders the identity fields of a request log line. A trusted request
+// adds trusted=true; an untrusted one keeps the shape it had before trust existed.
+func (c clientIdentity) logFields() string {
+	if !c.trusted {
+		return "credential=" + c.credential
+	}
+	return "credential=" + c.credential + " trusted=true"
+}
+
+// trustedToken renders a client address inside the trusted credential field. An
+// IPv6 address is bracketed so the token stays parseable; IPv4 stays plain.
+func trustedToken(addr netip.Addr) string {
+	if addr.Is6() {
+		return "[" + addr.String() + "]"
+	}
+	return addr.String()
 }
 
 // egress is the one egress decision for a target: the upstream to dial through
@@ -375,22 +435,28 @@ func Serve(ln net.Listener, cfg config.Config) *http.Server {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestsTotal.Inc()
 	auth := p.authenticate(r)
-	if !auth.ok {
+	trustedAddr, trusted := p.trusted.match(r.RemoteAddr)
+	if !auth.ok && !trusted {
 		authFailuresTotal.Inc()
 		miso.Debugf("proxy auth failed remote=%s name=%q", r.RemoteAddr, auth.attempted)
 		writeAuthChallenge(w)
 		return
 	}
 
+	identity := clientIdentity{credential: auth.name, trusted: trusted}
+	if !auth.ok {
+		identity.credential = "trusted:" + trustedToken(trustedAddr)
+	}
+
 	if r.Method == http.MethodConnect {
-		p.tunnel(w, r, auth.name)
+		p.tunnel(w, r, identity)
 		return
 	}
 
-	p.forward(w, r, auth.name)
+	p.forward(w, r, identity)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential string) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, identity clientIdentity) {
 	start := time.Now()
 	target := requestTarget(r)
 
@@ -413,12 +479,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, credential strin
 			egressName, bypass = chosen.name(), chosen.bypass
 		}
 		if failure != nil {
-			miso.Errorf("proxy request credential=%s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s error=%v",
-				credential, target, egressName, bypass, up.Load(), down.Load(), time.Since(start), outcome, failure)
+			miso.Errorf("proxy request %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s error=%v",
+				identity.logFields(), target, egressName, bypass, up.Load(), down.Load(), time.Since(start), outcome, failure)
 			return
 		}
-		miso.Infof("proxy request credential=%s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
-			credential, target, egressName, bypass, up.Load(), down.Load(), time.Since(start), outcome)
+		miso.Infof("proxy request %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
+			identity.logFields(), target, egressName, bypass, up.Load(), down.Load(), time.Since(start), outcome)
 	}()
 
 	// The request's Host is client-controlled, so it is validated before it can
@@ -637,7 +703,7 @@ func (p *Proxy) authenticate(r *http.Request) authentication {
 	return auth
 }
 
-func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, credential string) {
+func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, identity clientIdentity) {
 	start := time.Now()
 	chosen := p.egressFor(r.Context(), r.Host)
 	var (
@@ -659,15 +725,15 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, credential string
 		case chosen.upstream == nil && chosen.lookupFailure != nil:
 			outcome = "lookup-failed"
 		}
-		miso.Errorf("proxy tunnel failed credential=%s target=%s egress=%s bypass=%t duration=%s outcome=%s error=%v",
-			credential, r.Host, chosen.name(), chosen.bypass, time.Since(start), outcome, err)
+		miso.Errorf("proxy tunnel failed %s target=%s egress=%s bypass=%t duration=%s outcome=%s error=%v",
+			identity.logFields(), r.Host, chosen.name(), chosen.bypass, time.Since(start), outcome, err)
 		writeStatus(w, status)
 		return
 	}
 	defer target.Close()
 	defer func() {
-		miso.Infof("proxy tunnel credential=%s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
-			credential, r.Host, chosen.name(), chosen.bypass, up, down, time.Since(start), outcome)
+		miso.Infof("proxy tunnel %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
+			identity.logFields(), r.Host, chosen.name(), chosen.bypass, up, down, time.Since(start), outcome)
 	}()
 
 	hijacker, ok := w.(http.Hijacker)

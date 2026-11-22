@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/curtisnewbie/homeproxy/internal/config"
+	"github.com/curtisnewbie/miso/miso"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -1865,7 +1867,13 @@ func startTestProxy(t *testing.T) string {
 func startTestProxyWithConfig(t *testing.T, cfg config.Config) string {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	return startTestProxyAt(t, "127.0.0.1:0", cfg)
+}
+
+func startTestProxyAt(t *testing.T, listenAddr string, cfg config.Config) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -2482,5 +2490,425 @@ func readResponseHead(t *testing.T, br *bufio.Reader) (string, int, http.Header)
 			t.Fatalf("malformed header %q", line)
 		}
 		headers.Add(strings.TrimSpace(name), strings.TrimSpace(value))
+	}
+}
+
+// logBuffer collects what the proxy logs while one test runs.
+type logBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func captureProxyLogs(t *testing.T) *logBuffer {
+	t.Helper()
+
+	logs := &logBuffer{}
+	miso.SetLogOutput(logs)
+	t.Cleanup(func() { miso.SetLogOutput(os.Stderr) })
+	return logs
+}
+
+func waitForLogLine(t *testing.T, logs *logBuffer, parts ...string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, line := range strings.Split(logs.String(), "\n") {
+			matches := true
+			for _, part := range parts {
+				if !strings.Contains(line, part) {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				return line
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("log line containing %q not found\nlogs:\n%s", parts, logs.String())
+	return ""
+}
+
+func TestProxyTrustsSingleAddressWithoutCredential(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	const responseBody = "trusted client reached the target"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+	targetAddr := strings.TrimPrefix(target.URL, "http://")
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"127.0.0.1"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT without credential status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	waitForLogLine(t, logs, "proxy tunnel", "credential=trusted:127.0.0.1", "trusted=true")
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/trusted", "", nil, "")
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("forward without credential status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != responseBody {
+		t.Errorf("response body = %q, want %q", body, responseBody)
+	}
+
+	waitForLogLine(t, logs, "proxy request", "credential=trusted:127.0.0.1", "trusted=true")
+}
+
+func TestProxyTrustsCIDRRangeWithoutCredential(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"127.0.0.0/8"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT from inside the CIDR status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	if n := accepted.Load(); n != 1 {
+		t.Errorf("target accepted %d connection(s), want 1", n)
+	}
+}
+
+func TestProxyTrustsIPv6ClientWithoutCredential(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"::1"}
+	addr := startTestProxyAt(t, "[::1]:0", cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT from the IPv6 client status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	if n := accepted.Load(); n != 1 {
+		t.Errorf("target accepted %d connection(s), want 1", n)
+	}
+}
+
+func TestProxyChallengesClientsOutsideTrustedList(t *testing.T) {
+	tests := []struct {
+		name    string
+		trusted []string
+	}{
+		{name: "single address outside", trusted: []string{"127.0.0.2"}},
+		{name: "CIDR outside", trusted: []string{"10.0.0.0/8"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targetAddr, accepted := startCountingTarget(t)
+
+			cfg := testProxyConfig()
+			cfg.TrustedClients = tt.trusted
+			addr := startTestProxyWithConfig(t, cfg)
+
+			conn := dialProxy(t, addr)
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			writeConnect(t, conn, targetAddr, "")
+			if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusProxyAuthRequired {
+				t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusProxyAuthRequired, headers)
+			}
+			_ = conn.Close()
+
+			conn = dialProxy(t, addr)
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+targetAddr+"/", "", nil, "")
+			if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusProxyAuthRequired {
+				t.Errorf("forward status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+			}
+
+			if n := accepted.Load(); n != 0 {
+				t.Errorf("target accepted %d connection(s), want 0", n)
+			}
+		})
+	}
+}
+
+func TestProxyWithEmptyTrustedClientsKeepsChallenge(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusProxyAuthRequired {
+		t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusProxyAuthRequired, headers)
+	}
+	_ = conn.Close()
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+targetAddr+"/", "", nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Errorf("forward status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("target accepted %d connection(s), want 0", n)
+	}
+}
+
+func TestProxyTrustedClientWithValidCredentialKeepsName(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"127.0.0.0/8"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/named",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	line := waitForLogLine(t, logs, "proxy request", "credential="+testCredentialName, "trusted=true")
+	if strings.Contains(line, "credential=trusted:") {
+		t.Errorf("trusted line names the address instead of the credential: %q", line)
+	}
+}
+
+func TestProxyTrustedClientWithWrongCredentialIsAccepted(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	tests := []struct {
+		name string
+		auth string
+	}{
+		{name: "missing credential"},
+		{name: "wrong secret", auth: basicAuth(testCredentialName, "wrong-secret")},
+		{name: "unknown name", auth: basicAuth("stranger", testCredentialSecret)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureProxyLogs(t)
+
+			cfg := testProxyConfig()
+			cfg.TrustedClients = []string{"127.0.0.1"}
+			addr := startTestProxyWithConfig(t, cfg)
+
+			conn := dialProxy(t, addr)
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/wrong", tt.auth, nil, "")
+			if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d: a trusted address is allowed without a valid credential", resp.StatusCode, http.StatusOK)
+			}
+
+			waitForLogLine(t, logs, "proxy request", "credential=trusted:127.0.0.1", "trusted=true")
+		})
+	}
+}
+
+func TestProxyUntrustedCredentialLogKeepsShape(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	addr := startTestProxyWithConfig(t, testProxyConfig())
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/untrusted",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	line := waitForLogLine(t, logs, "proxy request", "credential="+testCredentialName)
+	if strings.Contains(line, "trusted") {
+		t.Errorf("untrusted line carries a trust field: %q", line)
+	}
+}
+
+func TestProxyTrustedMatchUnmapsIPv4MappedClient(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	const responseBody = "mapped client reached the target"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"127.0.0.1"}
+	handler := New(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, target.URL+"/mapped", nil)
+	req.RemoteAddr = "[::ffff:127.0.0.1]:42123"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if body := rec.Body.String(); body != responseBody {
+		t.Errorf("response body = %q, want %q", body, responseBody)
+	}
+	waitForLogLine(t, logs, "proxy request", "credential=trusted:127.0.0.1", "trusted=true")
+}
+
+func TestProxyTrustedClientStillForbidsPrivateTarget(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"127.0.0.0/8"}
+	cfg.Bypass = nil // nothing is exempt: the private-network guard decides on every target
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	const privateTarget = "10.1.2.3:443"
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, privateTarget, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusForbidden {
+		t.Errorf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusForbidden, headers)
+	}
+	_ = conn.Close()
+
+	conn = dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+privateTarget+"/", "", nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("forward status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+
+	assertNoDial(t, dialBefore)
+}
+
+func assertTrustedEntryAcceptsConnect(t *testing.T, entry string) {
+	t.Helper()
+
+	targetAddr, accepted := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{entry}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT without credential status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	if n := accepted.Load(); n != 1 {
+		t.Errorf("target accepted %d connection(s), want 1", n)
+	}
+}
+
+func TestProxyTrustsEntryWithHostBits(t *testing.T) {
+	assertTrustedEntryAcceptsConnect(t, "127.0.0.1/8")
+}
+
+func TestProxyTrustsWhitespacePaddedEntry(t *testing.T) {
+	assertTrustedEntryAcceptsConnect(t, " 127.0.0.1 ")
+}
+
+func TestProxyTrustsIPv4MappedEntry(t *testing.T) {
+	assertTrustedEntryAcceptsConnect(t, "::ffff:127.0.0.1/128")
+}
+
+func TestProxyTrustedMatchStripsIPv6Zone(t *testing.T) {
+	trusted := newTrustedList([]string{"fe80::/10"})
+
+	if _, ok := trusted.match("[fe80::1%en0]:4321"); !ok {
+		t.Error("zoned IPv6 client did not match the link-local entry")
+	}
+}
+
+func TestProxyTrustedIPv6LogBracketsAddress(t *testing.T) {
+	logs := captureProxyLogs(t)
+	targetAddr, _ := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"::1"}
+	addr := startTestProxyAt(t, "[::1]:0", cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT without credential status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	waitForLogLine(t, logs, "proxy tunnel", "credential=trusted:[::1]", "trusted=true")
+}
+
+func TestProxyTrustedClientWithValidCredentialKeepsNameOnConnect(t *testing.T) {
+	logs := captureProxyLogs(t)
+	targetAddr, _ := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.TrustedClients = []string{"127.0.0.0/8"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, basicAuth(testCredentialName, testCredentialSecret))
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	line := waitForLogLine(t, logs, "proxy tunnel", "credential="+testCredentialName, "trusted=true")
+	if strings.Contains(line, "credential=trusted:") {
+		t.Errorf("trusted tunnel line names the address instead of the credential: %q", line)
 	}
 }

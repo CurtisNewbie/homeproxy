@@ -11,6 +11,11 @@ a chosen egress.
 A name and secret pair that authorizes a client to use the proxy. Each device gets its own.
 _Avoid_: user, account, login
 
+**Trusted client**:
+An address — a single IPv4/IPv6 address or a CIDR — whose requests use the proxy without a
+credential. The private-network guard still applies to its targets.
+_Avoid_: whitelist, allowlist, IP auth
+
 **Egress**:
 Where traffic goes to reach the internet — through the upstream when one is configured, directly
 otherwise. One setting decides it for every connection.
