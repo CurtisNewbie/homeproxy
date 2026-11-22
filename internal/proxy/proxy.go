@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/curtisnewbie/homeproxy/internal/config"
+	"github.com/curtisnewbie/miso/flow"
 	"github.com/curtisnewbie/miso/miso"
 )
 
@@ -534,6 +535,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) servePAC(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.PACRequireTrustedClient {
 		if _, trusted := p.trusted.match(r.RemoteAddr); !trusted {
+			flow.Infof("Forbidden, %v", r.RemoteAddr)
 			writeStatus(w, http.StatusForbidden)
 			return
 		}
