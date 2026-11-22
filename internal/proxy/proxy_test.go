@@ -3127,6 +3127,57 @@ func TestProxyWithEmptyTrustedClientsKeepsChallenge(t *testing.T) {
 	}
 }
 
+func TestProxyWithNoCredentialsTrustsCIDRWithoutCredential(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.Credentials = nil
+	cfg.TrustedClients = []string{"127.0.0.0/8"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	if _, status, headers := readResponseHead(t, bufio.NewReader(conn)); status != http.StatusOK {
+		t.Fatalf("CONNECT from inside the CIDR status = %d, want %d (headers: %v)", status, http.StatusOK, headers)
+	}
+	_ = conn.Close()
+
+	if n := accepted.Load(); n != 1 {
+		t.Errorf("target accepted %d connection(s), want 1", n)
+	}
+}
+
+func TestProxyWithNoCredentialsChallengesUntrustedAddressAndDialsNothing(t *testing.T) {
+	targetAddr, accepted := startCountingTarget(t)
+
+	cfg := testProxyConfig()
+	cfg.Credentials = nil
+	// A configured but non-matching list: the config is one validate accepts, so
+	// this proves "no trusted match", not "no authorization configured".
+	cfg.TrustedClients = []string{"10.0.0.0/8"}
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, targetAddr, "")
+	_, status, headers := readResponseHead(t, bufio.NewReader(conn))
+
+	if status != http.StatusProxyAuthRequired {
+		t.Errorf("CONNECT status = %d, want %d", status, http.StatusProxyAuthRequired)
+	}
+	if got := headers.Get("Proxy-Authenticate"); got != proxyAuthChallenge {
+		t.Errorf("Proxy-Authenticate = %q, want %q", got, proxyAuthChallenge)
+	}
+	_ = conn.Close()
+
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("target accepted %d connection(s), want 0", n)
+	}
+	assertNoDial(t, dialBefore)
+}
+
 func TestProxyTrustedClientWithValidCredentialKeepsName(t *testing.T) {
 	logs := captureProxyLogs(t)
 

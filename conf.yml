@@ -39,6 +39,8 @@ homeproxy:
   # trusted-clients; with none, the file goes to nobody and startup warns. Set
   # this to false to serve the file to any address that can reach the proxy port.
   pac.require-trusted-client: true
+  # Basic auth credentials, one per device. Optional: a trusted client address
+  # authorizes on its own, and at least one of these two lists must be non-empty.
   users:
     - name: phone
       secret: change-me

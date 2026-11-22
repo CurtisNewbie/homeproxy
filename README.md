@@ -1,9 +1,9 @@
 # homeproxy
 
 An authenticated forward HTTP proxy for an iPhone's Wi-Fi proxy setting. It accepts absolute-form
-HTTP requests and `CONNECT` tunnels, checks Basic credentials from a config file, and forwards to a
-configurable upstream proxy (direct when the upstream is empty). It also generates a PAC file, so
-the phone can send one host through the proxy and another one direct.
+HTTP requests and `CONNECT` tunnels, authorizes a client by Basic credential or by trusted address,
+and forwards to a configurable upstream proxy (direct when the upstream is empty). It also generates
+a PAC file, so the phone can send one host through the proxy and another one direct.
 
 ## Build
 
@@ -95,6 +95,10 @@ One credential per device, so a single device can be revoked without breaking th
 port is plain HTTP with Basic auth (iOS cannot speak TLS to a proxy), so treat it as
 public-but-credentialled: use a long random secret rather than a memorable one, and give each device
 its own.
+
+A device can also be authorized by address instead, through `homeproxy.trusted-clients`. Those
+clients skip the credential check, so `homeproxy.users` may be left empty; configure at least one of
+the two lists or the service refuses to start.
 
 ### Automatic (per-host routing)
 

@@ -7,10 +7,10 @@ Load the `dev-flow` skill before starting any task — a feature, a bugfix, or w
 ## What this is
 
 `homeproxy` — an authenticated forward HTTP proxy for an iPhone's Wi-Fi proxy setting.
-It accepts absolute-form HTTP requests and `CONNECT` tunnels, checks Basic credentials from
-config, and forwards to a configurable upstream proxy (direct when the upstream is unset). It
-serves a generated PAC file at origin-form `GET /proxy.pac` on the proxy port, so a client can route
-per host.
+It accepts absolute-form HTTP requests and `CONNECT` tunnels, authorizes a client by Basic
+credential or by trusted address, and forwards to a configurable upstream proxy (direct when the
+upstream is unset). It serves a generated PAC file at origin-form `GET /proxy.pac` on the proxy port,
+so a client can route per host.
 
 Stack: Go + miso (`github.com/curtisnewbie/miso`). Load the `miso` skill for framework questions.
 

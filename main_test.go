@@ -567,15 +567,22 @@ func TestProcessClosesProxyListenerOnSigterm(t *testing.T) {
 	}
 }
 
-func TestProcessRejectsEmptyCredentials(t *testing.T) {
+func TestProcessBootsWithNoUsersAndTrustedClient(t *testing.T) {
+	app := startAppWithConf(t, "  trusted-clients:\n    - 127.0.0.0/8\n")
+	app.waitUntilHealthy(t)
+}
+
+func TestProcessRejectsNoUsersAndNoTrustedClients(t *testing.T) {
 	proxyPort, managementPort := freePortPair(t)
 
 	output := runToExit(t, writeConf(t, proxyPort, managementPort, "  users: []\n"))
 
-	if !strings.Contains(output, "homeproxy.users") {
-		t.Errorf("output does not name homeproxy.users:\n%s", output)
+	for _, key := range []string{"homeproxy.users", "homeproxy.trusted-clients"} {
+		if !strings.Contains(output, key) {
+			t.Errorf("output does not name %s:\n%s", key, output)
+		}
 	}
-	if !strings.Contains(output, "at least one credential") {
+	if !strings.Contains(output, "configure at least one of") {
 		t.Errorf("output does not explain the problem:\n%s", output)
 	}
 }

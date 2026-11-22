@@ -53,6 +53,9 @@ homeproxy:
   # List props are NOT expanded from ${ENV} either: the name and secret below
   # are literal values. Replace the placeholder with a long random secret per
   # device before deploying, or mount your own config over /conf/conf.yml.
+  # This list is optional: a trusted client address authorizes on its own, so
+  # leave it out when trusted-clients covers every device that needs access.
+  # At least one of the two lists must be non-empty.
   users:
     - name: phone
       secret: replace-with-a-long-random-secret

@@ -17,7 +17,7 @@ const (
 	// misoconfig-prop: Port on which the forward HTTP proxy listens | 17890
 	propProxyPort = "homeproxy.port"
 
-	// misoconfig-prop: Basic auth credentials allowed to use the proxy, as a list of name/secret entries
+	// misoconfig-prop: Basic auth credentials allowed to use the proxy, as a list of name/secret entries; optional when homeproxy.trusted-clients is configured
 	propCredentials = "homeproxy.users"
 
 	// misoconfig-prop: Upstream proxy address (host:port); empty means direct connections
@@ -126,8 +126,12 @@ func (c *Config) validate() error {
 	if c.ManagementPort <= 0 {
 		return fmt.Errorf("server.port must be a positive port, got %d", c.ManagementPort)
 	}
-	if len(c.Credentials) == 0 {
-		return errors.New("homeproxy.users must contain at least one credential")
+	trustedClients, err := ParseTrustedClients(c.TrustedClients)
+	if err != nil {
+		return err
+	}
+	if len(c.Credentials) == 0 && len(trustedClients) == 0 {
+		return errors.New("configure at least one of homeproxy.users and homeproxy.trusted-clients")
 	}
 	for i, cred := range c.Credentials {
 		if cred.Name == "" || cred.Secret == "" {
@@ -137,9 +141,6 @@ func (c *Config) validate() error {
 	c.PACMode = strings.ToLower(strings.TrimSpace(c.PACMode))
 	if c.PACMode != PACModeDirect && c.PACMode != PACModeProxy {
 		return fmt.Errorf("homeproxy.pac.mode %q must be %q or %q", c.PACMode, PACModeDirect, PACModeProxy)
-	}
-	if _, err := ParseTrustedClients(c.TrustedClients); err != nil {
-		return err
 	}
 	if err := validatePACEntries(KeyPACDirect, c.PACDirect); err != nil {
 		return err

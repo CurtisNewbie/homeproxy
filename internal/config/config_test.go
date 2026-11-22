@@ -15,6 +15,42 @@ func validTestConfig() Config {
 	}
 }
 
+func TestValidateAuthorizationSources(t *testing.T) {
+	tests := []struct {
+		name           string
+		credentials    []Credential
+		trustedClients []string
+		wantErr        bool
+	}{
+		{name: "no users one trusted client", trustedClients: []string{"127.0.0.0/8"}},
+		{name: "no users no trusted clients", wantErr: true},
+		{name: "users set no trusted clients", credentials: []Credential{{Name: "phone", Secret: "s3cret"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validTestConfig()
+			cfg.Credentials = tt.credentials
+			cfg.TrustedClients = tt.trustedClients
+			err := cfg.validate()
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("validate() = nil, want an error")
+			}
+			for _, key := range []string{"homeproxy.users", "homeproxy.trusted-clients"} {
+				if !strings.Contains(err.Error(), key) {
+					t.Errorf("error does not name %s: %v", key, err)
+				}
+			}
+		})
+	}
+}
+
 func TestValidHost(t *testing.T) {
 	tests := []struct {
 		host string
