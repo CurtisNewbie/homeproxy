@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,13 +47,17 @@ type Proxy struct {
 	cfg       config.Config
 	upstream  *upstream
 	bypass    bypassList
+	pac       pac
 	trusted   trustedList
 	resolver  *resolver
 	transport *http.Transport
 }
 
 func New(cfg config.Config) *Proxy {
-	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), trusted: newTrustedList(cfg.TrustedClients), resolver: newResolver()}
+	if cfg.PACRequireTrustedClient && len(cfg.TrustedClients) == 0 {
+		miso.Warnf("homeproxy.pac.require-trusted-client is on but homeproxy.trusted-clients is empty: /proxy.pac is served to nobody")
+	}
+	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), pac: newPAC(cfg.PACDirect), trusted: newTrustedList(cfg.TrustedClients), resolver: newResolver()}
 	if cfg.Upstream != "" {
 		p.upstream = &upstream{
 			addr: cfg.Upstream,
@@ -93,7 +98,7 @@ type bypassList struct {
 func newBypassList(entries []string) bypassList {
 	list := bypassList{hosts: make(map[string]struct{}, len(entries))}
 	for _, entry := range entries {
-		entry = hostOnly(entry)
+		entry = config.HostOnly(entry)
 		if entry == "" {
 			continue
 		}
@@ -112,7 +117,7 @@ func newBypassList(entries []string) bypassList {
 // and ignores the port, so "Example.COM:443" matches an "example.com" entry. A
 // "*.suffix" entry matches subdomains only; the bare suffix is not a subdomain.
 func (b bypassList) matches(target string) bool {
-	host := hostOnly(target)
+	host := config.HostOnly(target)
 	if _, ok := b.hosts[host]; ok {
 		return true
 	}
@@ -124,17 +129,51 @@ func (b bypassList) matches(target string) bool {
 	return false
 }
 
-// hostOnly reduces an authority to the comparable part of a host name: no port,
-// no IPv6 brackets, no trailing dot, lowercase.
-func hostOnly(authority string) string {
-	authority = strings.TrimSpace(authority)
-	if host, _, err := net.SplitHostPort(authority); err == nil {
-		authority = host
+// pac renders the Proxy Auto-Configuration file served at /proxy.pac.
+type pac struct {
+	direct bypassList
+}
+
+func newPAC(direct []string) pac {
+	return pac{direct: newBypassList(direct)}
+}
+
+// script renders the file for one proxy token. The entries were validated at
+// load and normalized in newBypassList, so the body carries only normalized
+// values.
+func (p pac) script(proxy string) string {
+	var b strings.Builder
+	b.WriteString("function FindProxyForURL(url, host) {\n")
+	b.WriteString("  host = host.toLowerCase();\n")
+	// A client passes an IPv6 literal bracketed; the entries are not, because
+	// the list went through HostOnly.
+	b.WriteString("  if (host.charAt(0) === \"[\") { host = host.slice(1, -1); }\n")
+	hosts := make([]string, 0, len(p.direct.hosts))
+	for host := range p.direct.hosts {
+		hosts = append(hosts, host)
 	}
-	authority = strings.TrimPrefix(authority, "[")
-	authority = strings.TrimSuffix(authority, "]")
-	authority = strings.TrimSuffix(authority, ".")
-	return strings.ToLower(authority)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		fmt.Fprintf(&b, "  if (host === %s) { return \"DIRECT\"; }\n", jsString(host))
+	}
+	for _, suffix := range p.direct.suffixes {
+		// The leading dot and the strict length leave the bare suffix unmatched,
+		// exactly like bypassList.matches.
+		fmt.Fprintf(&b, "  if (host.length > %d && host.slice(-%d) === %s) { return \"DIRECT\"; }\n",
+			len(suffix)+1, len(suffix)+1, jsString("."+suffix))
+	}
+	fmt.Fprintf(&b, "  return %s;\n", jsString("PROXY "+proxy+"; DIRECT"))
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// jsString renders s as a JavaScript double-quoted string literal. The inputs
+// are character-restricted, so escaping the quote and the escape character is
+// enough; a Go literal (%q) would emit escapes JavaScript does not know.
+func jsString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }
 
 // trustedList is the parsed homeproxy.trusted-clients value, parsed once in New
@@ -156,7 +195,7 @@ func newTrustedList(entries []string) trustedList {
 // host part of the connection's address and nothing else: no header, no DNS. An
 // IPv4-mapped IPv6 address is unmapped so it matches an IPv4 entry.
 func (t trustedList) match(remoteAddr string) (netip.Addr, bool) {
-	addr, err := netip.ParseAddr(hostOnly(remoteAddr))
+	addr, err := netip.ParseAddr(config.HostOnly(remoteAddr))
 	if err != nil {
 		return netip.Addr{}, false
 	}
@@ -249,7 +288,7 @@ func (p *Proxy) egressFor(ctx context.Context, target string) egress {
 		return egress{bypass: true}
 	}
 
-	host := hostOnly(target)
+	host := config.HostOnly(target)
 	resolveCtx := ctx
 	if p.cfg.DialTimeout > 0 {
 		var cancel context.CancelFunc
@@ -434,6 +473,12 @@ func Serve(ln net.Listener, cfg config.Config) *http.Server {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestsTotal.Inc()
+	// A PAC fetch is origin-form; proxied traffic arrives absolute-form or as
+	// CONNECT, so the two can never mean the same request.
+	if r.Method == http.MethodGet && !r.URL.IsAbs() && r.URL.Path == "/proxy.pac" {
+		p.servePAC(w, r)
+		return
+	}
 	auth := p.authenticate(r)
 	trustedAddr, trusted := p.trusted.match(r.RemoteAddr)
 	if !auth.ok && !trusted {
@@ -454,6 +499,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.forward(w, r, identity)
+}
+
+// servePAC writes the generated PAC file. It runs before authentication because
+// iOS sends no credential in automatic mode; the file is public unless
+// homeproxy.pac.require-trusted-client restricts it to the trusted address list.
+func (p *Proxy) servePAC(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.PACRequireTrustedClient {
+		if _, trusted := p.trusted.match(r.RemoteAddr); !trusted {
+			writeStatus(w, http.StatusForbidden)
+			return
+		}
+	}
+	proxyAddr := p.cfg.PACProxy
+	if proxyAddr == "" {
+		host := config.HostOnly(r.Host)
+		if !config.ValidHost(host) {
+			writeStatus(w, http.StatusBadRequest)
+			return
+		}
+		proxyAddr = net.JoinHostPort(host, strconv.Itoa(p.cfg.ProxyPort))
+	} else if host, port, err := net.SplitHostPort(proxyAddr); err == nil {
+		// Load validated the address; the port is re-emitted as its number so a
+		// leading zero or sign cannot make the client reject the file.
+		if number, err := strconv.Atoi(port); err == nil {
+			proxyAddr = net.JoinHostPort(host, strconv.Itoa(number))
+		}
+	}
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.WriteString(w, p.pac.script(proxyAddr))
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, identity clientIdentity) {

@@ -372,8 +372,14 @@ type appProcess struct {
 func startApp(t *testing.T) *appProcess {
 	t.Helper()
 
+	return startAppWithConf(t, validCredentialsConf)
+}
+
+func startAppWithConf(t *testing.T, extra string) *appProcess {
+	t.Helper()
+
 	proxyPort, managementPort := freePortPair(t)
-	confPath := writeConf(t, proxyPort, managementPort, validCredentialsConf)
+	confPath := writeConf(t, proxyPort, managementPort, extra)
 
 	cmd := exec.Command(testBinary, "configFile="+confPath)
 	output := &lockedBuffer{}
@@ -602,6 +608,99 @@ func TestProcessRejectsMalformedTrustedClient(t *testing.T) {
 	}
 	if !strings.Contains(output, "not a valid address or CIDR") {
 		t.Errorf("output does not explain the problem:\n%s", output)
+	}
+}
+
+func TestProcessRejectsMalformedPACDirect(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "host with a space", value: "bad host"},
+		{name: "host with a quote and a semicolon", value: `a";evil().x`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyPort, managementPort := freePortPair(t)
+
+			conf := validCredentialsConf + "  pac:\n    direct:\n      - '" + tt.value + "'\n"
+			output := runToExit(t, writeConf(t, proxyPort, managementPort, conf))
+
+			if !strings.Contains(output, "homeproxy.pac.direct") {
+				t.Errorf("output does not name homeproxy.pac.direct:\n%s", output)
+			}
+			if !strings.Contains(output, fmt.Sprintf("%q", tt.value)) {
+				t.Errorf("output does not name the rejected entry %q:\n%s", tt.value, output)
+			}
+		})
+	}
+}
+
+func TestProcessRejectsMalformedPACProxy(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "missing port", value: "example.com"},
+		{name: "host with a quote", value: `a";evil().x:3128`},
+		{name: "host with a space", value: "a; PROXY attacker:1080"},
+		{name: "port zero", value: "example.com:0"},
+		{name: "port above range", value: "example.com:70000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyPort, managementPort := freePortPair(t)
+
+			conf := validCredentialsConf + "  pac:\n    proxy: '" + tt.value + "'\n"
+			output := runToExit(t, writeConf(t, proxyPort, managementPort, conf))
+
+			if !strings.Contains(output, "homeproxy.pac.proxy") {
+				t.Errorf("output does not name homeproxy.pac.proxy:\n%s", output)
+			}
+			if !strings.Contains(output, fmt.Sprintf("%q", tt.value)) {
+				t.Errorf("output does not name the rejected address %q:\n%s", tt.value, output)
+			}
+		})
+	}
+}
+
+func TestProcessAcceptsNormalizedPACDirectEntries(t *testing.T) {
+	conf := validCredentialsConf + `  pac:
+    direct:
+      - a.com:80
+      - example.com.
+      - "[::1]"
+`
+	app := startAppWithConf(t, conf)
+	app.waitUntilHealthy(t)
+}
+
+func TestProcessBootsWithPACGateOnAndNoTrustedClients(t *testing.T) {
+	app := startApp(t)
+	app.waitUntilHealthy(t)
+
+	// The default gate is on and the config lists no trusted clients: the
+	// service boots, warns once, and refuses every PAC fetch.
+	app.waitForLine(t, "homeproxy.pac.require-trusted-client is on but homeproxy.trusted-clients is empty")
+
+	conn := dialAppProxy(t, app)
+	if _, err := fmt.Fprintf(conn, "GET /proxy.pac HTTP/1.1\r\nHost: phone.example\r\n\r\n"); err != nil {
+		t.Fatalf("write PAC request: %v", err)
+	}
+	status, headers := readAppResponseHead(t, bufio.NewReader(conn))
+	if status != http.StatusForbidden {
+		t.Errorf("PAC status = %d, want %d from the default gate", status, http.StatusForbidden)
+	}
+	if got := headers.Get("Content-Length"); got != "0" {
+		t.Errorf("Content-Length = %q, want 0", got)
+	}
+
+	// The warning comes from construction, not from the refused fetch.
+	const warning = "homeproxy.pac.require-trusted-client is on but homeproxy.trusted-clients is empty"
+	if n := strings.Count(app.output.String(), warning); n != 1 {
+		t.Errorf("warning appeared %d time(s), want 1\noutput:\n%s", n, app.output.String())
 	}
 }
 

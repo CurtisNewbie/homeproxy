@@ -3,6 +3,9 @@ app:
 
 server:
   port: 7990
+  # The management surface stays on loopback; only the proxy port is reachable
+  # from the network.
+  host: 127.0.0.1
 
 consul:
   enabled: false
@@ -20,6 +23,17 @@ homeproxy:
   # guard still applies, so a private target still needs a bypass entry.
   # trusted-clients: ["192.168.31.0/24"]
   trusted-clients: []
+  # The PAC file served at GET /proxy.pac. Lists hosts the phone reaches without
+  # the proxy; every other host is sent through it. `proxy` is what the file
+  # names; leave it empty to derive the address from the request and homeproxy.port.
+  # pac.direct: ["api.weibo.cn", "*.corp.internal"]
+  # pac.proxy: "192.168.31.51:17890"
+  pac.direct: []
+  pac.proxy: ""
+  # Serve /proxy.pac only to addresses in trusted-clients. Needs a non-empty
+  # trusted-clients; with none, the file goes to nobody and startup warns. Set
+  # this to false to serve the file to any address that can reach the proxy port.
+  pac.require-trusted-client: true
   users:
     - name: phone
       secret: change-me

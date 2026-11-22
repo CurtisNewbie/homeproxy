@@ -2,7 +2,8 @@
 
 An authenticated forward HTTP proxy for an iPhone's Wi-Fi proxy setting. It accepts absolute-form
 HTTP requests and `CONNECT` tunnels, checks Basic credentials from a config file, and forwards to a
-configurable upstream proxy (direct when the upstream is empty).
+configurable upstream proxy (direct when the upstream is empty). It also generates a PAC file, so
+the phone can send one host through the proxy and another one direct.
 
 ## Build
 
@@ -73,8 +74,10 @@ startup; rotating a credential or changing the upstream means editing the file a
 `${VAR}` / `${VAR:default}` expansion applies **only to string props** — `homeproxy.upstream`,
 `homeproxy.upstream.username`, `homeproxy.upstream.password` — because those are read as strings,
 and miso expands the placeholder when it reads a string prop. List props (`homeproxy.users`,
-`homeproxy.bypass`) and numeric props (`homeproxy.port`, `homeproxy.dial-timeout-seconds`,
-`server.port`) are read as literal values; `${...}` in them is not expanded.
+`homeproxy.bypass`, `homeproxy.pac.direct`), numeric props (`homeproxy.port`,
+`homeproxy.dial-timeout-seconds`, `server.port`) and boolean props
+(`homeproxy.pac.require-trusted-client`) are read as literal values; `${...}` in them is not
+expanded.
 
 ## Phone settings
 
@@ -92,6 +95,31 @@ One credential per device, so a single device can be revoked without breaking th
 port is plain HTTP with Basic auth (iOS cannot speak TLS to a proxy), so treat it as
 public-but-credentialled: use a long random secret rather than a memorable one, and give each device
 its own.
+
+### Automatic (per-host routing)
+
+Manual sends every request to homeproxy. **Automatic** takes one URL and lets the phone decide per
+request. Point it at the generated file:
+
+**Configure Proxy → Automatic**, URL `http://<host>:17890/proxy.pac`
+
+- `homeproxy.pac.direct` — hosts the phone should reach itself, exact host or `*.suffix` — answer
+  `DIRECT`.
+- every other host answers `PROXY <proxy>; DIRECT`, where `<proxy>` is `homeproxy.pac.proxy` when
+  set, otherwise the request's `Host` with `homeproxy.port`.
+- the file is served without a credential, because iOS ignores `ProxyUsername` and `ProxyPassword`
+  in Automatic mode. `homeproxy.pac.require-trusted-client` (default on) serves it only to addresses
+  in `homeproxy.trusted-clients`; anything else gets `403`. With no trusted clients the file goes to
+  nobody and startup logs a warning. Set it to `false` to serve the file to anything that can reach
+  the proxy port.
+- `; DIRECT` is a fallback path: when homeproxy is down or refuses a request, the phone retries it
+  on its own connection. That includes the private-network guard, so a refused target can still be
+  reached directly by the phone.
+
+The PAC direct list is **not** `homeproxy.bypass`. Bypass decides homeproxy's own egress; the PAC
+list decides the phone's. A host reachable only from the home network — `curtisnewbie.com` in the
+sample — must stay off the PAC direct list, or the phone tries it directly and fails whenever it is
+away from home.
 
 Hosts not listed in `homeproxy.bypass` that resolve to a non-public address are refused (the
 private-network guard) — loopback, private, link-local, CGNAT, benchmarking, reserved, metadata and

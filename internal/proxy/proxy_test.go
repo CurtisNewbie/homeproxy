@@ -40,6 +40,9 @@ func testProxyConfig() config.Config {
 		// refuses unless the host is declared as ours. Tests that exercise the
 		// guard clear this on purpose.
 		Bypass: []string{"127.0.0.1"},
+		// The PAC gate is off unless a test asks for it: these Configs are built
+		// directly, so the config default does not apply.
+		PACRequireTrustedClient: false,
 	}
 }
 
@@ -1775,6 +1778,358 @@ func TestProxyBypassNonListedHostUsesUpstream(t *testing.T) {
 	}
 	if seen[0].authority != publicTarget {
 		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, publicTarget)
+	}
+}
+
+const pacContentType = "application/x-ns-proxy-autoconfig"
+
+func originFormGet(t *testing.T, addr, host, path, auth string) *http.Response {
+	t.Helper()
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	var request strings.Builder
+	fmt.Fprintf(&request, "GET %s HTTP/1.1\r\nHost: %s\r\n", path, host)
+	if auth != "" {
+		fmt.Fprintf(&request, "Proxy-Authorization: %s\r\n", auth)
+	}
+	request.WriteString("\r\n")
+	if _, err := io.WriteString(conn, request.String()); err != nil {
+		t.Fatalf("write origin-form request: %v", err)
+	}
+
+	return readProxyResponse(t, conn, http.MethodGet)
+}
+
+func readBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	return string(body)
+}
+
+func TestPACAnswersOriginFormGETWithoutCredential(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("Content-Type"); got != pacContentType {
+		t.Errorf("Content-Type = %q, want %q", got, pacContentType)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, "function FindProxyForURL(url, host)") {
+		t.Errorf("body does not define FindProxyForURL:\n%s", body)
+	}
+	if !strings.Contains(body, `return "PROXY 10.0.0.5:3128; DIRECT";`) {
+		t.Errorf("body does not fall back to the proxy:\n%s", body)
+	}
+}
+
+func TestPACRoutesListedHostsDirectly(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACDirect = []string{"api.example.com", "MiXeD.example", "*.corp.internal"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+
+	// An exact entry is an equality test; a "*.suffix" entry is a subdomain
+	// test, whose strict length and leading dot leave the bare suffix unmatched.
+	for _, want := range []string{
+		`host = host.toLowerCase();`,
+		`if (host === "api.example.com") { return "DIRECT"; }`,
+		`if (host === "mixed.example") { return "DIRECT"; }`,
+		`if (host.length > 14 && host.slice(-14) === ".corp.internal") { return "DIRECT"; }`,
+		`return "PROXY 10.0.0.5:3128; DIRECT";`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body is missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `host === "corp.internal"`) {
+		t.Errorf("the bare suffix is matched as an exact host:\n%s", body)
+	}
+}
+
+func TestPACEmptyDirectListHasNoDirectBranch(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	if strings.Contains(body, `return "DIRECT";`) {
+		t.Errorf("body has a DIRECT branch with an empty direct list:\n%s", body)
+	}
+	if !strings.Contains(body, `return "PROXY 10.0.0.5:3128; DIRECT";`) {
+		t.Errorf("body does not fall back to the proxy:\n%s", body)
+	}
+}
+
+func TestPACDerivesProxyFromRequestHost(t *testing.T) {
+	cfg := testProxyConfig()
+	addr := startTestProxyWithConfig(t, cfg)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split proxy address %q: %v", addr, err)
+	}
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	want := `PROXY phone.example:` + port + `; DIRECT`
+	if !strings.Contains(body, want) {
+		t.Errorf("body does not derive %q from the request Host:\n%s", want, body)
+	}
+}
+
+func TestPACDerivesBracketedIPv6Proxy(t *testing.T) {
+	cfg := testProxyConfig()
+	addr := startTestProxyWithConfig(t, cfg)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split proxy address %q: %v", addr, err)
+	}
+
+	body := readBody(t, originFormGet(t, addr, "[2001:db8::1]:8888", "/proxy.pac", ""))
+	want := `PROXY [2001:db8::1]:` + port + `; DIRECT`
+	if !strings.Contains(body, want) {
+		t.Errorf("body does not keep the IPv6 host bracketed as %q:\n%s", want, body)
+	}
+}
+
+func TestPACStripsIPv6BracketsFromHost(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACDirect = []string{"::1"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	for _, want := range []string{
+		`if (host.charAt(0) === "[") { host = host.slice(1, -1); }`,
+		`if (host === "::1") { return "DIRECT"; }`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body is missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPACAnswersForPrivateRequestHost(t *testing.T) {
+	cfg := testProxyConfig()
+	addr := startTestProxyWithConfig(t, cfg)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split proxy address %q: %v", addr, err)
+	}
+
+	// The private-network guard never sees this path: the proxy host comes from
+	// the request Host, and the PAC answer needs no connection.
+	resp := originFormGet(t, addr, "127.0.0.1:9999", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	want := `PROXY 127.0.0.1:` + port + `; DIRECT`
+	if body := readBody(t, resp); !strings.Contains(body, want) {
+		t.Errorf("body does not name %q:\n%s", want, body)
+	}
+}
+
+func TestPACNormalizesConfiguredProxyPort(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACProxy = "example.com:03128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	if !strings.Contains(body, `return "PROXY example.com:3128; DIRECT";`) {
+		t.Errorf("body does not emit the port as its number:\n%s", body)
+	}
+	if strings.Contains(body, "03128") {
+		t.Errorf("body still carries the unpadded port:\n%s", body)
+	}
+}
+
+func TestPACFetchNeverReachesUpstream(t *testing.T) {
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	addr := startTestProxyWithConfig(t, cfg)
+
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if body := readBody(t, resp); !strings.Contains(body, "FindProxyForURL") {
+		t.Errorf("body is not the PAC file:\n%s", body)
+	}
+	if n := upstream.acceptCount(); n != 0 {
+		t.Errorf("upstream accepted %d connection(s), want 0", n)
+	}
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want nothing", seen)
+	}
+}
+
+func TestPACWithoutGateServesUntrustedAddress(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACRequireTrustedClient = false
+	cfg.TrustedClients = []string{"127.0.0.2"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d with the gate off", resp.StatusCode, http.StatusOK)
+	}
+	if body := readBody(t, resp); !strings.Contains(body, "FindProxyForURL") {
+		t.Errorf("body is not the PAC file:\n%s", body)
+	}
+}
+
+func TestPACGateOnWithEmptyTrustedClientsRefusesEveryone(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACRequireTrustedClient = true
+	cfg.TrustedClients = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d with no trusted clients", resp.StatusCode, http.StatusForbidden)
+	}
+	if body := readBody(t, resp); body != "" {
+		t.Errorf("body = %q, want empty", body)
+	}
+}
+
+func TestPACRequireTrustedClientServesListedAddress(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACRequireTrustedClient = true
+	cfg.TrustedClients = []string{"127.0.0.0/8"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d for a listed address", resp.StatusCode, http.StatusOK)
+	}
+	if body := readBody(t, resp); !strings.Contains(body, "FindProxyForURL") {
+		t.Errorf("body is not the PAC file:\n%s", body)
+	}
+}
+
+func TestPACRequireTrustedClientRefusesUnlistedAddress(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACRequireTrustedClient = true
+	cfg.TrustedClients = []string{"127.0.0.2"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d for an unlisted address", resp.StatusCode, http.StatusForbidden)
+	}
+	if body := readBody(t, resp); body != "" {
+		t.Errorf("body = %q, want empty", body)
+	}
+}
+
+func TestPACRequireTrustedClientIgnoresCredential(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACRequireTrustedClient = true
+	cfg.TrustedClients = []string{"127.0.0.2"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	auth := basicAuth(testCredentialName, testCredentialSecret)
+	resp := originFormGet(t, addr, "phone.example:8888", "/proxy.pac", auth)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d even with a valid credential", resp.StatusCode, http.StatusForbidden)
+	}
+	if body := readBody(t, resp); body != "" {
+		t.Errorf("body = %q, want empty", body)
+	}
+}
+
+func TestPACRequireTrustedClientDoesNotGateProxying(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACRequireTrustedClient = true
+	cfg.TrustedClients = []string{"127.0.0.2"}
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://203.0.113.7:1/", "", nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Errorf("status = %d, want %d from the proxy's own auth", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+}
+
+func TestPACRejectsUnusableRequestHost(t *testing.T) {
+	cfg := testProxyConfig()
+	addr := startTestProxyWithConfig(t, cfg)
+
+	// No pac.proxy is set, so the request Host supplies the proxy token. A Host
+	// that is not a hostname or IP literal is refused rather than emitted.
+	resp := originFormGet(t, addr, "bad*host", "/proxy.pac", "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	if body := readBody(t, resp); body != "" {
+		t.Errorf("body = %q, want empty", body)
+	}
+}
+
+func TestPACAbsoluteFormRequestIsForwarded(t *testing.T) {
+	const responseBody = "target served /proxy.pac"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer target.Close()
+
+	cfg := testProxyConfig()
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, target.URL+"/proxy.pac",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+
+	resp := readProxyResponse(t, conn, http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body := readBody(t, resp)
+	if body != responseBody {
+		t.Errorf("body = %q, want the forwarded %q", body, responseBody)
+	}
+	if strings.Contains(body, "FindProxyForURL") {
+		t.Errorf("an absolute-form /proxy.pac request served the PAC file")
+	}
+}
+
+func TestPACConnectToProxyPacHostStillTunnels(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.Bypass = nil
+	cfg.DialTimeout = 300 * time.Millisecond
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, "proxy.pac:80", basicAuth(testCredentialName, testCredentialSecret))
+
+	_, status, headers := readResponseHead(t, bufio.NewReader(conn))
+	if status != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d from the tunnel path", status, http.StatusBadGateway)
+	}
+	if got := headers.Get("Content-Type"); got == pacContentType {
+		t.Errorf("CONNECT to proxy.pac was answered with the PAC content type")
 	}
 }
 
