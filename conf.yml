@@ -23,22 +23,21 @@ homeproxy:
   # guard still applies, so a private target still needs a bypass entry.
   # trusted-clients: ["192.168.31.0/24"]
   trusted-clients: []
-  # The PAC file served at GET /proxy.pac. `mode: direct` sends only the hosts in
-  # pac.proxy-hosts through the proxy and everything else direct; `mode: proxy`
-  # does the reverse, exempting the hosts in pac.direct. `proxy` is the address
-  # the file names; leave it empty to derive it from the request and homeproxy.port.
-  pac.mode: direct
-  # pac.proxy-hosts: ["api.weibo.cn", "*.corp.internal"]
-  pac.proxy-hosts: []
-  # Used only when pac.mode is proxy.
-  # pac.direct: ["api.weibo.cn"]
-  pac.direct: []
-  # pac.proxy: "192.168.31.51:17890"
-  pac.proxy: ""
-  # Serve /proxy.pac only to addresses in trusted-clients. Needs a non-empty
-  # trusted-clients; with none, the file goes to nobody and startup warns. Set
-  # this to false to serve the file to any address that can reach the proxy port.
-  pac.require-trusted-client: true
+  pac:
+    mode: proxy
+    proxy-hosts:
+      - "*.youtube.com"
+      - "*.m-youtube.com"
+      - "www.gstatic.com"
+      - "*.googlevideo.com"
+      - "*.ytimg.com"
+      - "*.googleapis.com"
+    # Used only when pac.mode is proxy.
+    # pac.direct: ["api.localdomain"]
+    direct: []
+    # proxy: "{homeproxy_ip}:17890"
+    proxy: "192.168.1.254:17890"
+
   # Basic auth credentials, one per device. Optional: a trusted client address
   # authorizes on its own, and at least one of these two lists must be non-empty.
   users:
