@@ -35,16 +35,16 @@ const (
 	// misoconfig-prop: What the upstream carries: all sends every non-bypass target to it, pac sends only the targets the PAC file routes through the proxy and dials the rest direct | all
 	propUpstreamEgress = "homeproxy.upstream.egress"
 
-	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host or *.suffix
+	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host, or *.suffix covering the suffix and its subdomains
 	propBypass = "homeproxy.bypass"
 
 	// misoconfig-prop: PAC routing mode: direct proxies only homeproxy.pac.proxy-hosts, proxy exempts only homeproxy.pac.direct | direct
 	propPACMode = "homeproxy.pac.mode"
 
-	// misoconfig-prop: Hosts the generated PAC file sends through the proxy in direct mode; exact host or *.suffix
+	// misoconfig-prop: Hosts the generated PAC file sends through the proxy in direct mode; exact host, or *.suffix covering the suffix and its subdomains
 	KeyPACProxyHosts = "homeproxy.pac.proxy-hosts"
 
-	// misoconfig-prop: Hosts the generated PAC file sends direct; exact host or *.suffix
+	// misoconfig-prop: Hosts the generated PAC file sends direct; exact host, or *.suffix covering the suffix and its subdomains
 	KeyPACDirect = "homeproxy.pac.direct"
 
 	// misoconfig-prop: Address the generated PAC file names as the proxy, as host:port; empty uses the request Host and homeproxy.port
@@ -204,7 +204,8 @@ func ValidHost(host string) bool {
 }
 
 // validPACEntry reports whether entry is a host newBypassList can match: the
-// same HostOnly normalization, then an optional "*." denoting subdomains.
+// same HostOnly normalization, then an optional "*." covering the suffix and
+// its subdomains.
 func validPACEntry(entry string) bool {
 	host := HostOnly(entry)
 	suffix, wildcard := strings.CutPrefix(host, "*.")

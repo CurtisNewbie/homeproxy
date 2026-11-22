@@ -1597,45 +1597,69 @@ func TestProxyBypassExactHostForwardsDirectDespiteUpstream(t *testing.T) {
 	}
 }
 
-func TestProxyBypassWildcardMatchesSubdomainsNotBareSuffix(t *testing.T) {
+func TestProxyBypassWildcardMatchesApexAndSubdomains(t *testing.T) {
 	upstream := startFakeUpstream(t)
 	cfg := testProxyConfig()
 	cfg.Upstream = upstream.addr()
 	cfg.Bypass = []string{"*.localhost"}
 	addr := startTestProxyWithConfig(t, cfg)
 
-	connect := func(target string) int {
-		t.Helper()
-		conn := dialProxy(t, addr)
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		writeConnect(t, conn, target, basicAuth(testCredentialName, testCredentialSecret))
-		_, status, _ := readResponseHead(t, bufio.NewReader(conn))
-		_ = conn.Close()
-		return status
+	// A wildcard covers the bare suffix as well as its subdomains: both bypass
+	// the upstream and the private-network guard, so the unresolvable host is
+	// dialled directly and never reaches the upstream.
+	for _, target := range []string{"localhost:1", "sub.localhost:1"} {
+		if status := connectStatus(t, addr, target); status != http.StatusBadGateway {
+			t.Errorf("CONNECT %s status = %d, want %d from the direct dial", target, status, http.StatusBadGateway)
+		}
+		if seen := upstream.seen(); len(seen) != 0 {
+			t.Errorf("upstream observed %+v after %s, want nothing", seen, target)
+		}
 	}
 
-	// A subdomain matches the wildcard: the proxy dials it itself, so the
-	// unresolvable host never reaches the upstream.
-	if status := connect("sub.localhost:1"); status != http.StatusBadGateway {
-		t.Errorf("subdomain status = %d, want %d from the direct dial", status, http.StatusBadGateway)
-	}
-	if seen := upstream.seen(); len(seen) != 0 {
-		t.Errorf("upstream observed %+v after a matching subdomain, want nothing", seen)
-	}
-
-	// The bare suffix is not a subdomain and must be listed separately: it keeps
-	// using the upstream. A public, non-routable authority stands in for such a
-	// host, so the guard lets it through to the upstream instead of refusing it.
-	const bareTarget = "203.0.113.7:1"
-	if status := connect(bareTarget); status != http.StatusBadGateway {
-		t.Errorf("bare suffix status = %d, want %d", status, http.StatusBadGateway)
+	// A host outside the wildcard keeps using the upstream. A public,
+	// non-routable authority stands in for one, so the guard lets it through.
+	const otherTarget = "203.0.113.7:1"
+	if status := connectStatus(t, addr, otherTarget); status != http.StatusBadGateway {
+		t.Errorf("unlisted host status = %d, want %d", status, http.StatusBadGateway)
 	}
 	seen := upstream.seen()
 	if len(seen) != 1 {
-		t.Fatalf("upstream observed %d request(s) after the bare suffix, want 1: %+v", len(seen), seen)
+		t.Fatalf("upstream observed %d request(s) after the unlisted host, want 1: %+v", len(seen), seen)
 	}
-	if seen[0].authority != bareTarget {
-		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, bareTarget)
+	if seen[0].authority != otherTarget {
+		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, otherTarget)
+	}
+}
+
+func TestProxyBypassExactHostDoesNotMatchSubdomains(t *testing.T) {
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = []string{"example.com"}
+	cfg.DialTimeout = 200 * time.Millisecond
+	addr := startTestProxyWithConfig(t, cfg)
+
+	// The exact entry covers the named host alone: it bypasses the upstream and
+	// the guard, so it is dialled directly.
+	if status := connectStatus(t, addr, "example.com:1"); status != http.StatusBadGateway {
+		t.Errorf("exact host status = %d, want %d from the direct dial", status, http.StatusBadGateway)
+	}
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v after the exact host, want nothing", seen)
+	}
+
+	// A subdomain of the named host is not covered, so it keeps using the
+	// upstream.
+	const subdomain = "sub.example.com:1"
+	if status := connectStatus(t, addr, subdomain); status != http.StatusBadGateway {
+		t.Errorf("subdomain status = %d, want %d", status, http.StatusBadGateway)
+	}
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s) after the subdomain, want 1: %+v", len(seen), seen)
+	}
+	if seen[0].authority != subdomain {
+		t.Errorf("upstream CONNECT authority = %q, want %q", seen[0].authority, subdomain)
 	}
 }
 
@@ -2108,21 +2132,57 @@ func TestPACRoutesListedHostsDirectly(t *testing.T) {
 
 	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
 
-	// An exact entry is an equality test; a "*.suffix" entry is a subdomain
-	// test, whose strict length and leading dot leave the bare suffix unmatched.
+	// An exact entry is an equality test; a "*.suffix" entry covers the bare
+	// suffix and its subdomains with one comparison.
 	for _, want := range []string{
 		`host = host.toLowerCase();`,
 		`if (host === "api.example.com") { return "DIRECT"; }`,
 		`if (host === "mixed.example") { return "DIRECT"; }`,
-		`if (host.length > 14 && host.slice(-14) === ".corp.internal") { return "DIRECT"; }`,
+		`if (("." + host).slice(-14) === ".corp.internal") { return "DIRECT"; }`,
 		`return "PROXY 10.0.0.5:3128; DIRECT";`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body is missing %q:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, `host === "corp.internal"`) {
-		t.Errorf("the bare suffix is matched as an exact host:\n%s", body)
+}
+
+func TestPACExactAndWildcardEntryForSameHostIsRedundant(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
+	cfg.PACDirect = []string{"example.com", "*.example.com"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+
+	// Both entries are emitted, each covering only its own rule: the pair is
+	// redundant, not an error, and answers the same verdict as either alone.
+	for _, want := range []string{
+		`if (host === "example.com") { return "DIRECT"; }`,
+		`if (("." + host).slice(-12) === ".example.com") { return "DIRECT"; }`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body is missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPACDropsTrailingDotLikeTheServer(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"*.example.com"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+
+	// The server's HostOnly drops a trailing dot before matching. The body must
+	// do the same, or a phone asking about "example.com." gets the opposite
+	// answer from the one the server gives the same request.
+	want := `if (host.charAt(host.length - 1) === ".") { host = host.slice(0, -1); }`
+	if !strings.Contains(body, want) {
+		t.Errorf("body is missing the trailing-dot normalization %q:\n%s", want, body)
 	}
 }
 
@@ -2170,15 +2230,12 @@ func TestPACDirectModeSendsListedHostsToProxy(t *testing.T) {
 		`host = host.toLowerCase();`,
 		`if (host === "api.example.com") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
 		`if (host === "mixed.example") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
-		`if (host.length > 14 && host.slice(-14) === ".corp.internal") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
+		`if (("." + host).slice(-14) === ".corp.internal") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
 		`return "DIRECT";`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body is missing %q:\n%s", want, body)
 		}
-	}
-	if strings.Contains(body, `host === "corp.internal"`) {
-		t.Errorf("the bare suffix is matched as an exact host:\n%s", body)
 	}
 }
 
@@ -2895,6 +2952,19 @@ func (c *bufferedConn) CloseWrite() error {
 		return cw.CloseWrite()
 	}
 	return c.Conn.Close()
+}
+
+// connectStatus sends a CONNECT for target through the proxy at addr with the
+// test credential and returns the response status, so a test can tell the
+// direct dial from the upstream without inspecting the request.
+func connectStatus(t *testing.T, addr, target string) int {
+	t.Helper()
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeConnect(t, conn, target, basicAuth(testCredentialName, testCredentialSecret))
+	_, status, _ := readResponseHead(t, bufio.NewReader(conn))
+	_ = conn.Close()
+	return status
 }
 
 func writeConnect(t *testing.T, conn net.Conn, target, auth string) {

@@ -26,9 +26,13 @@ The HTTP proxy that homeproxy hands connections to when an egress other than dir
 configured.
 _Avoid_: parent proxy, chained proxy
 
+**Host list**:
+A list of target hosts — `homeproxy.bypass` and the two PAC lists. An entry is an exact host, which
+covers that host alone, or a `*.suffix`, which covers the suffix host and every host under it.
+_Avoid_: route list, whitelist, domain list
+
 **Bypass**:
-A host list — exact host or `*.suffix` — whose entries use the direct egress and are exempt from the
-private-network guard.
+A host list whose entries use the direct egress and are exempt from the private-network guard.
 _Avoid_: route, whitelist, no-proxy list
 
 **PAC file**:

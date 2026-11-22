@@ -125,14 +125,16 @@ func newBypassList(entries []string) bypassList {
 
 // matches reports whether target's host is listed. Matching is case-insensitive
 // and ignores the port, so "Example.COM:443" matches an "example.com" entry. A
-// "*.suffix" entry matches subdomains only; the bare suffix is not a subdomain.
+// "*.suffix" entry matches the bare suffix and its subdomains.
 func (b bypassList) matches(target string) bool {
 	host := config.HostOnly(target)
 	if _, ok := b.hosts[host]; ok {
 		return true
 	}
 	for _, suffix := range b.suffixes {
-		if strings.HasSuffix(host, "."+suffix) {
+		// Prepend the dot so one comparison covers both the bare suffix and
+		// its subdomains.
+		if strings.HasSuffix("."+host, "."+suffix) {
 			return true
 		}
 	}
@@ -194,6 +196,9 @@ func (p pac) script(proxy string) string {
 	// A client passes an IPv6 literal bracketed; the entries are not, because
 	// the list went through HostOnly.
 	b.WriteString("  if (host.charAt(0) === \"[\") { host = host.slice(1, -1); }\n")
+	// HostOnly also drops a trailing dot, so the body must too or the two
+	// disagree on a host written as "example.com.".
+	b.WriteString("  if (host.charAt(host.length - 1) === \".\") { host = host.slice(0, -1); }\n")
 	entries, listed, unlisted := p.proxyHosts, "PROXY "+proxy+"; DIRECT", "DIRECT"
 	if p.mode == config.PACModeProxy {
 		entries, listed, unlisted = p.direct, "DIRECT", "PROXY "+proxy+"; DIRECT"
@@ -207,10 +212,9 @@ func (p pac) script(proxy string) string {
 		fmt.Fprintf(&b, "  if (host === %s) { return %s; }\n", jsString(host), jsString(listed))
 	}
 	for _, suffix := range entries.suffixes {
-		// The leading dot and the strict length leave the bare suffix unmatched,
-		// exactly like bypassList.matches.
-		fmt.Fprintf(&b, "  if (host.length > %d && host.slice(-%d) === %s) { return %s; }\n",
-			len(suffix)+1, len(suffix)+1, jsString("."+suffix), jsString(listed))
+		// Prefixing the dot covers the bare suffix as well as its subdomains.
+		fmt.Fprintf(&b, "  if ((\".\" + host).slice(-%d) === %s) { return %s; }\n",
+			len(suffix)+1, jsString("."+suffix), jsString(listed))
 	}
 	fmt.Fprintf(&b, "  return %s;\n", jsString(unlisted))
 	b.WriteString("}\n")

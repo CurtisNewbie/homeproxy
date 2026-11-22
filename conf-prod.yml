@@ -26,8 +26,9 @@ homeproxy:
     # What the upstream carries: all sends every target that is not in bypass
     # to it; pac sends only the hosts the PAC file routes through the proxy.
     egress: all
-  # Exact host or *.suffix; hosts listed here bypass the upstream and are exempt
-  # from the private-network guard.
+  # Exact host, or *.suffix covering the suffix host and its subdomains; hosts
+  # listed here bypass the upstream and are exempt from the private-network
+  # guard.
   bypass: []
   # Client addresses that use the proxy without a credential: an IPv4/IPv6
   # address or a CIDR. Trust replaces the credential only — the private-network

@@ -103,7 +103,9 @@ request. Point it at the generated file:
 - `homeproxy.pac.mode` decides the direction. `direct` (the default) sends only the hosts in
   `homeproxy.pac.proxy-hosts` through homeproxy and everything else direct; `proxy` does the
   reverse, sending everything through homeproxy except the hosts in `homeproxy.pac.direct`. Both
-  lists match an exact host or a `*.suffix`, and only the list belonging to the active mode is read;
+  lists take an exact host, which covers that host alone, or a `*.suffix`, which covers the suffix
+  itself and every host under it — so `*.youtube.com` covers `youtube.com` as well, and nothing
+  expresses "subdomains only". Only the list belonging to the active mode is read;
   the other one logs a warning at startup if it has entries.
 - `PROXY <proxy>` is `homeproxy.pac.proxy` when set, otherwise the request's `Host` with
   `homeproxy.port`.
@@ -123,5 +125,6 @@ away from home.
 
 Hosts not listed in `homeproxy.bypass` that resolve to a non-public address are refused (the
 private-network guard) — loopback, private, link-local, CGNAT, benchmarking, reserved, metadata and
-multicast ranges. List a host in `homeproxy.bypass` (exact host or `*.suffix`) when it is yours;
-bypassed hosts use the direct egress and are exempt from that guard.
+multicast ranges. List a host in `homeproxy.bypass` (exact host, or `*.suffix` covering the suffix
+and its subdomains) when it is yours; bypassed hosts use the direct egress and are exempt from that
+guard.
