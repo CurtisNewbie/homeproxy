@@ -137,6 +137,11 @@ func (b bypassList) empty() bool {
 	return len(b.hosts) == 0 && len(b.suffixes) == 0
 }
 
+// pacCacheLifetime bounds how long a client may reuse a PAC it already fetched.
+// CFNetwork reads only Expires and otherwise caches for 24 hours, so this is the
+// whole cache policy.
+const pacCacheLifetime = 5 * time.Minute
+
 // pac renders the Proxy Auto-Configuration file served at /proxy.pac. Only the
 // mode's own list is consulted; the other is parsed but never emitted.
 type pac struct {
@@ -560,10 +565,10 @@ func (p *Proxy) servePAC(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
 	w.Header().Set("Cache-Control", "no-store")
 	// CFNetwork ignores Cache-Control and honours only Expires, defaulting to a
-	// 24-hour cache when the header is absent: without this, a phone keeps
-	// evaluating the file it fetched yesterday and cannot be fixed by editing
-	// the config. A past date keeps the fetch fresh on every evaluation.
-	w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
+	// 24-hour cache when the header is absent. Five minutes keeps a config edit
+	// visible quickly while a still-fresh entry survives a transient failure to
+	// fetch the file, which would otherwise drop the client to DIRECT.
+	w.Header().Set("Expires", time.Now().Add(pacCacheLifetime).UTC().Format(http.TimeFormat))
 	// Info, so the box shows whether the client ever fetched the file: a PAC the
 	// client never loads and a PAC it loads but ignores look identical from the
 	// proxy, because neither produces a request log line.

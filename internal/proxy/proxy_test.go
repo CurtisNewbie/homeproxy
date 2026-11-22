@@ -1829,8 +1829,15 @@ func TestPACAnswersOriginFormGETWithoutCredential(t *testing.T) {
 		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
 	}
 	// CFNetwork caches a PAC for 24 hours unless Expires says otherwise.
-	if got := resp.Header.Get("Expires"); got != "Thu, 01 Jan 1970 00:00:00 GMT" {
-		t.Errorf("Expires = %q, want a date in the past", got)
+	if got := resp.Header.Get("Expires"); got != "" {
+		expires, err := http.ParseTime(got)
+		if err != nil {
+			t.Errorf("Expires = %q: %v", got, err)
+		} else if wait := time.Until(expires); wait <= 0 || wait > pacCacheLifetime+time.Minute {
+			t.Errorf("Expires = %q is %s away, want about %s", got, wait, pacCacheLifetime)
+		}
+	} else {
+		t.Error("Expires is missing: a PAC client would cache the file for 24 hours")
 	}
 	body := readBody(t, resp)
 	if !strings.Contains(body, "function FindProxyForURL(url, host)") {
