@@ -33,7 +33,8 @@ _Avoid_: route, whitelist, no-proxy list
 
 **PAC file**:
 The Proxy Auto-Configuration script served at `/proxy.pac`, which a client fetches to choose, per
-request, between homeproxy and a direct connection. Its entries are the PAC direct list, not the
+request, between homeproxy and a direct connection. Its entries are the list the active
+`homeproxy.pac.mode` consults — `proxy-hosts` in `direct` mode, `direct` in `proxy` mode — not the
 bypass list.
 _Avoid_: proxy URL, auto-proxy config, wpad.dat
 

@@ -32,8 +32,14 @@ const (
 	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host or *.suffix
 	propBypass = "homeproxy.bypass"
 
+	// misoconfig-prop: PAC routing mode: direct proxies only homeproxy.pac.proxy-hosts, proxy exempts only homeproxy.pac.direct | direct
+	propPACMode = "homeproxy.pac.mode"
+
+	// misoconfig-prop: Hosts the generated PAC file sends through the proxy in direct mode; exact host or *.suffix
+	KeyPACProxyHosts = "homeproxy.pac.proxy-hosts"
+
 	// misoconfig-prop: Hosts the generated PAC file sends direct; exact host or *.suffix
-	propPACDirect = "homeproxy.pac.direct"
+	KeyPACDirect = "homeproxy.pac.direct"
 
 	// misoconfig-prop: Address the generated PAC file names as the proxy, as host:port; empty uses the request Host and homeproxy.port
 	propPACProxy = "homeproxy.pac.proxy"
@@ -54,12 +60,19 @@ const (
 // misoconfig-default-start
 func init() {
 	miso.SetDefProp(propProxyPort, 17890)
+	miso.SetDefProp(propPACMode, "direct")
 	miso.SetDefProp(propPACRequireTrustedClient, true)
 	miso.SetDefProp(propDialTimeoutSeconds, 10)
 	miso.SetDefProp(propManagementPort, 7990)
 }
 
 // misoconfig-default-end
+
+// PAC routing modes for homeproxy.pac.mode.
+const (
+	PACModeDirect = "direct"
+	PACModeProxy  = "proxy"
+)
 
 type Credential struct {
 	Name   string
@@ -74,7 +87,9 @@ type Config struct {
 	UpstreamUsername        string
 	UpstreamPassword        string
 	Bypass                  []string
+	PACMode                 string
 	PACDirect               []string
+	PACProxyHosts           []string
 	PACProxy                string
 	PACRequireTrustedClient bool
 	TrustedClients          []string
@@ -90,7 +105,9 @@ func Load() (Config, error) {
 		UpstreamUsername:        miso.GetPropStr(propUpstreamUsername),
 		UpstreamPassword:        miso.GetPropStr(propUpstreamPassword),
 		Bypass:                  miso.GetPropStrSlice(propBypass),
-		PACDirect:               miso.GetPropStrSlice(propPACDirect),
+		PACMode:                 miso.GetPropStr(propPACMode),
+		PACDirect:               miso.GetPropStrSlice(KeyPACDirect),
+		PACProxyHosts:           miso.GetPropStrSlice(KeyPACProxyHosts),
 		PACProxy:                miso.GetPropStr(propPACProxy),
 		PACRequireTrustedClient: miso.GetPropBool(propPACRequireTrustedClient),
 		TrustedClients:          miso.GetPropStrSlice(propTrustedClients),
@@ -102,7 +119,7 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-func (c Config) validate() error {
+func (c *Config) validate() error {
 	if c.ProxyPort <= 0 {
 		return fmt.Errorf("homeproxy.port must be a positive port, got %d", c.ProxyPort)
 	}
@@ -117,13 +134,18 @@ func (c Config) validate() error {
 			return fmt.Errorf("homeproxy.users entry %d must have both name and secret", i)
 		}
 	}
+	c.PACMode = strings.ToLower(strings.TrimSpace(c.PACMode))
+	if c.PACMode != PACModeDirect && c.PACMode != PACModeProxy {
+		return fmt.Errorf("homeproxy.pac.mode %q must be %q or %q", c.PACMode, PACModeDirect, PACModeProxy)
+	}
 	if _, err := ParseTrustedClients(c.TrustedClients); err != nil {
 		return err
 	}
-	for i, entry := range c.PACDirect {
-		if !validPACDirect(entry) {
-			return fmt.Errorf("homeproxy.pac.direct entry %d %q must be a hostname or IP literal, optionally *. prefixed", i, entry)
-		}
+	if err := validatePACEntries(KeyPACDirect, c.PACDirect); err != nil {
+		return err
+	}
+	if err := validatePACEntries(KeyPACProxyHosts, c.PACProxyHosts); err != nil {
+		return err
 	}
 	if c.PACProxy != "" {
 		host, port, err := net.SplitHostPort(c.PACProxy)
@@ -150,9 +172,9 @@ func ValidHost(host string) bool {
 	return validHostname(host)
 }
 
-// validPACDirect reports whether entry is a host newBypassList can match: the
+// validPACEntry reports whether entry is a host newBypassList can match: the
 // same HostOnly normalization, then an optional "*." denoting subdomains.
-func validPACDirect(entry string) bool {
+func validPACEntry(entry string) bool {
 	host := HostOnly(entry)
 	suffix, wildcard := strings.CutPrefix(host, "*.")
 	if !ValidHost(suffix) {
@@ -164,6 +186,15 @@ func validPACDirect(entry string) bool {
 		return !wildcard && addr.Zone() == ""
 	}
 	return true
+}
+
+func validatePACEntries(key string, entries []string) error {
+	for i, entry := range entries {
+		if !validPACEntry(entry) {
+			return fmt.Errorf("%s entry %d %q must be a hostname or IP literal, optionally *. prefixed", key, i, entry)
+		}
+	}
+	return nil
 }
 
 func allDigits(s string) bool {

@@ -1814,6 +1814,7 @@ func readBody(t *testing.T, resp *http.Response) string {
 
 func TestPACAnswersOriginFormGETWithoutCredential(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	cfg.PACProxy = "10.0.0.5:3128"
 	addr := startTestProxyWithConfig(t, cfg)
 
@@ -1838,6 +1839,7 @@ func TestPACAnswersOriginFormGETWithoutCredential(t *testing.T) {
 
 func TestPACRoutesListedHostsDirectly(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	cfg.PACDirect = []string{"api.example.com", "MiXeD.example", "*.corp.internal"}
 	cfg.PACProxy = "10.0.0.5:3128"
 	addr := startTestProxyWithConfig(t, cfg)
@@ -1864,6 +1866,7 @@ func TestPACRoutesListedHostsDirectly(t *testing.T) {
 
 func TestPACEmptyDirectListHasNoDirectBranch(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	cfg.PACProxy = "10.0.0.5:3128"
 	addr := startTestProxyWithConfig(t, cfg)
 
@@ -1876,8 +1879,82 @@ func TestPACEmptyDirectListHasNoDirectBranch(t *testing.T) {
 	}
 }
 
+func TestPACDefaultsToDirectMode(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	if !strings.Contains(body, `return "DIRECT";`) {
+		t.Errorf("default mode does not answer DIRECT for an unlisted host:\n%s", body)
+	}
+	if strings.Contains(body, `PROXY 10.0.0.5:3128`) {
+		t.Errorf("default mode routes to the proxy with no proxy-hosts:\n%s", body)
+	}
+}
+
+func TestPACDirectModeSendsListedHostsToProxy(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"api.example.com", "MiXeD.example", "*.corp.internal"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+
+	// A listed host is sent through the proxy with the DIRECT fallback; every
+	// other host takes the DIRECT default.
+	for _, want := range []string{
+		`host = host.toLowerCase();`,
+		`if (host === "api.example.com") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
+		`if (host === "mixed.example") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
+		`if (host.length > 14 && host.slice(-14) === ".corp.internal") { return "PROXY 10.0.0.5:3128; DIRECT"; }`,
+		`return "DIRECT";`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body is missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `host === "corp.internal"`) {
+		t.Errorf("the bare suffix is matched as an exact host:\n%s", body)
+	}
+}
+
+func TestPACDirectModeIgnoresPACDirectList(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACDirect = []string{"api.example.com"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	if strings.Contains(body, "api.example.com") {
+		t.Errorf("direct mode emits the inert pac.direct list:\n%s", body)
+	}
+	if !strings.Contains(body, `return "DIRECT";`) {
+		t.Errorf("direct mode does not answer DIRECT:\n%s", body)
+	}
+}
+
+func TestPACProxyModeIgnoresProxyHosts(t *testing.T) {
+	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
+	cfg.PACProxyHosts = []string{"api.example.com"}
+	cfg.PACProxy = "10.0.0.5:3128"
+	addr := startTestProxyWithConfig(t, cfg)
+
+	body := readBody(t, originFormGet(t, addr, "phone.example:8888", "/proxy.pac", ""))
+	if strings.Contains(body, "api.example.com") {
+		t.Errorf("proxy mode emits the inert proxy-hosts list:\n%s", body)
+	}
+	if !strings.Contains(body, `return "PROXY 10.0.0.5:3128; DIRECT";`) {
+		t.Errorf("proxy mode does not fall back to the proxy:\n%s", body)
+	}
+}
+
 func TestPACDerivesProxyFromRequestHost(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	addr := startTestProxyWithConfig(t, cfg)
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1893,6 +1970,7 @@ func TestPACDerivesProxyFromRequestHost(t *testing.T) {
 
 func TestPACDerivesBracketedIPv6Proxy(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	addr := startTestProxyWithConfig(t, cfg)
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1908,6 +1986,7 @@ func TestPACDerivesBracketedIPv6Proxy(t *testing.T) {
 
 func TestPACStripsIPv6BracketsFromHost(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	cfg.PACDirect = []string{"::1"}
 	cfg.PACProxy = "10.0.0.5:3128"
 	addr := startTestProxyWithConfig(t, cfg)
@@ -1925,6 +2004,7 @@ func TestPACStripsIPv6BracketsFromHost(t *testing.T) {
 
 func TestPACAnswersForPrivateRequestHost(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	addr := startTestProxyWithConfig(t, cfg)
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1945,6 +2025,7 @@ func TestPACAnswersForPrivateRequestHost(t *testing.T) {
 
 func TestPACNormalizesConfiguredProxyPort(t *testing.T) {
 	cfg := testProxyConfig()
+	cfg.PACMode = config.PACModeProxy
 	cfg.PACProxy = "example.com:03128"
 	addr := startTestProxyWithConfig(t, cfg)
 

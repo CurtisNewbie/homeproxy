@@ -12,6 +12,8 @@ For more configuration, see [github.com/curtisnewbie/miso](https://github.com/Cu
 | homeproxy.upstream.username          | Username for authenticating against the upstream proxy                                                          |               |
 | homeproxy.upstream.password          | Password for authenticating against the upstream proxy                                                          |               |
 | homeproxy.bypass                     | Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host or *.suffix      |               |
+| homeproxy.pac.mode                   | PAC routing mode: direct proxies only homeproxy.pac.proxy-hosts, proxy exempts only homeproxy.pac.direct        | direct        |
+| homeproxy.pac.proxy-hosts            | Hosts the generated PAC file sends through the proxy in direct mode; exact host or *.suffix                     |               |
 | homeproxy.pac.direct                 | Hosts the generated PAC file sends direct; exact host or *.suffix                                               |               |
 | homeproxy.pac.proxy                  | Address the generated PAC file names as the proxy, as host:port; empty uses the request Host and homeproxy.port |               |
 | homeproxy.pac.require-trusted-client | Serve the PAC file only to addresses in homeproxy.trusted-clients                                               | true          |

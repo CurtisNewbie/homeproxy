@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,7 @@ func validTestConfig() Config {
 		ProxyPort:      17890,
 		ManagementPort: 7990,
 		Credentials:    []Credential{{Name: "phone", Secret: "s3cret"}},
+		PACMode:        PACModeDirect,
 	}
 }
 
@@ -59,6 +61,59 @@ func TestValidatePACDirectEntries(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "homeproxy.pac.direct") || !strings.Contains(err.Error(), entry) {
 			t.Errorf("error for %q does not name the entry: %v", entry, err)
+		}
+	}
+}
+
+func TestValidatePACMode(t *testing.T) {
+	for _, value := range []string{"direct", "proxy", " DIRECT ", "Proxy"} {
+		cfg := validTestConfig()
+		cfg.PACMode = value
+		if err := cfg.validate(); err != nil {
+			t.Errorf("homeproxy.pac.mode %q rejected: %v", value, err)
+			continue
+		}
+		if want := strings.ToLower(strings.TrimSpace(value)); cfg.PACMode != want {
+			t.Errorf("homeproxy.pac.mode after validate = %q, want %q", cfg.PACMode, want)
+		}
+	}
+
+	for _, value := range []string{"", "auto", "proxyy"} {
+		cfg := validTestConfig()
+		cfg.PACMode = value
+		err := cfg.validate()
+		if err == nil {
+			t.Errorf("homeproxy.pac.mode %q accepted", value)
+			continue
+		}
+		if !strings.Contains(err.Error(), "homeproxy.pac.mode") || !strings.Contains(err.Error(), fmt.Sprintf("%q", value)) {
+			t.Errorf("error for %q does not name the key and the value: %v", value, err)
+		}
+	}
+}
+
+func TestValidatePACProxyHostsEntries(t *testing.T) {
+	accepted := []string{"a.com:80", "example.com.", "[::1]", "*.a.com"}
+	rejected := []string{"*.[::1]:80", "*.::1", "fe80::1%25en0", "bad host"}
+
+	for _, entry := range accepted {
+		cfg := validTestConfig()
+		cfg.PACProxyHosts = []string{entry}
+		if err := cfg.validate(); err != nil {
+			t.Errorf("homeproxy.pac.proxy-hosts %q rejected: %v", entry, err)
+		}
+	}
+
+	for _, entry := range rejected {
+		cfg := validTestConfig()
+		cfg.PACProxyHosts = []string{entry}
+		err := cfg.validate()
+		if err == nil {
+			t.Errorf("homeproxy.pac.proxy-hosts %q accepted", entry)
+			continue
+		}
+		if !strings.Contains(err.Error(), "homeproxy.pac.proxy-hosts") || !strings.Contains(err.Error(), entry) {
+			t.Errorf("error for %q does not name the key and the entry: %v", entry, err)
 		}
 	}
 }

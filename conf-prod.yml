@@ -34,12 +34,17 @@ homeproxy:
   # trusted-clients: ["192.168.31.0/24"]
   trusted-clients: []
   # The PAC file at GET /proxy.pac, for iOS Automatic mode. List props are
-  # literal. `direct` names hosts the phone reaches without the proxy; every
-  # other host is sent through it. `proxy` is the address the file names; empty
-  # derives it from the request Host and homeproxy.port.
-  # pac.direct: ["api.weibo.cn", "*.corp.internal"]
-  # pac.proxy: "192.168.31.51:17890"
+  # literal. `mode: direct` sends only pac.proxy-hosts through the proxy and
+  # everything else direct; `mode: proxy` does the reverse, exempting pac.direct.
+  # `proxy` is the address the file names; empty derives it from the request Host
+  # and homeproxy.port.
+  pac.mode: direct
+  # pac.proxy-hosts: ["api.weibo.cn", "*.corp.internal"]
+  pac.proxy-hosts: []
+  # Used only when pac.mode is proxy.
+  # pac.direct: ["api.weibo.cn"]
   pac.direct: []
+  # pac.proxy: "192.168.31.51:17890"
   pac.proxy: ""
   # Serve /proxy.pac only to addresses in trusted-clients. Requires a non-empty
   # trusted-clients; with none, the file goes to nobody and startup warns. Set

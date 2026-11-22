@@ -57,7 +57,10 @@ func New(cfg config.Config) *Proxy {
 	if cfg.PACRequireTrustedClient && len(cfg.TrustedClients) == 0 {
 		miso.Warnf("homeproxy.pac.require-trusted-client is on but homeproxy.trusted-clients is empty: /proxy.pac is served to nobody")
 	}
-	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), pac: newPAC(cfg.PACDirect), trusted: newTrustedList(cfg.TrustedClients), resolver: newResolver()}
+	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), pac: newPAC(cfg.PACMode, cfg.PACDirect, cfg.PACProxyHosts), trusted: newTrustedList(cfg.TrustedClients), resolver: newResolver()}
+	if key, ignored := p.pac.ignoredList(); ignored {
+		miso.Warnf("%s has entries but homeproxy.pac.mode is %s: the list is ignored", key, p.pac.mode)
+	}
 	if cfg.Upstream != "" {
 		p.upstream = &upstream{
 			addr: cfg.Upstream,
@@ -129,13 +132,33 @@ func (b bypassList) matches(target string) bool {
 	return false
 }
 
-// pac renders the Proxy Auto-Configuration file served at /proxy.pac.
-type pac struct {
-	direct bypassList
+func (b bypassList) empty() bool {
+	return len(b.hosts) == 0 && len(b.suffixes) == 0
 }
 
-func newPAC(direct []string) pac {
-	return pac{direct: newBypassList(direct)}
+// pac renders the Proxy Auto-Configuration file served at /proxy.pac. Only the
+// mode's own list is consulted; the other is parsed but never emitted.
+type pac struct {
+	mode       string
+	direct     bypassList
+	proxyHosts bypassList
+}
+
+func newPAC(mode string, direct, proxyHosts []string) pac {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != config.PACModeProxy {
+		mode = config.PACModeDirect
+	}
+	return pac{mode: mode, direct: newBypassList(direct), proxyHosts: newBypassList(proxyHosts)}
+}
+
+// ignoredList names the list the active mode does not consult, when it has
+// entries the operator will not see take effect.
+func (p pac) ignoredList() (string, bool) {
+	if p.mode == config.PACModeProxy {
+		return config.KeyPACProxyHosts, !p.proxyHosts.empty()
+	}
+	return config.KeyPACDirect, !p.direct.empty()
 }
 
 // script renders the file for one proxy token. The entries were validated at
@@ -148,21 +171,25 @@ func (p pac) script(proxy string) string {
 	// A client passes an IPv6 literal bracketed; the entries are not, because
 	// the list went through HostOnly.
 	b.WriteString("  if (host.charAt(0) === \"[\") { host = host.slice(1, -1); }\n")
-	hosts := make([]string, 0, len(p.direct.hosts))
-	for host := range p.direct.hosts {
+	entries, listed, unlisted := p.proxyHosts, "PROXY "+proxy+"; DIRECT", "DIRECT"
+	if p.mode == config.PACModeProxy {
+		entries, listed, unlisted = p.direct, "DIRECT", "PROXY "+proxy+"; DIRECT"
+	}
+	hosts := make([]string, 0, len(entries.hosts))
+	for host := range entries.hosts {
 		hosts = append(hosts, host)
 	}
 	sort.Strings(hosts)
 	for _, host := range hosts {
-		fmt.Fprintf(&b, "  if (host === %s) { return \"DIRECT\"; }\n", jsString(host))
+		fmt.Fprintf(&b, "  if (host === %s) { return %s; }\n", jsString(host), jsString(listed))
 	}
-	for _, suffix := range p.direct.suffixes {
+	for _, suffix := range entries.suffixes {
 		// The leading dot and the strict length leave the bare suffix unmatched,
 		// exactly like bypassList.matches.
-		fmt.Fprintf(&b, "  if (host.length > %d && host.slice(-%d) === %s) { return \"DIRECT\"; }\n",
-			len(suffix)+1, len(suffix)+1, jsString("."+suffix))
+		fmt.Fprintf(&b, "  if (host.length > %d && host.slice(-%d) === %s) { return %s; }\n",
+			len(suffix)+1, len(suffix)+1, jsString("."+suffix), jsString(listed))
 	}
-	fmt.Fprintf(&b, "  return %s;\n", jsString("PROXY "+proxy+"; DIRECT"))
+	fmt.Fprintf(&b, "  return %s;\n", jsString(unlisted))
 	b.WriteString("}\n")
 	return b.String()
 }

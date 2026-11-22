@@ -74,8 +74,8 @@ startup; rotating a credential or changing the upstream means editing the file a
 `${VAR}` / `${VAR:default}` expansion applies **only to string props** — `homeproxy.upstream`,
 `homeproxy.upstream.username`, `homeproxy.upstream.password` — because those are read as strings,
 and miso expands the placeholder when it reads a string prop. List props (`homeproxy.users`,
-`homeproxy.bypass`, `homeproxy.pac.direct`), numeric props (`homeproxy.port`,
-`homeproxy.dial-timeout-seconds`, `server.port`) and boolean props
+`homeproxy.bypass`, `homeproxy.pac.direct`, `homeproxy.pac.proxy-hosts`), numeric props
+(`homeproxy.port`, `homeproxy.dial-timeout-seconds`, `server.port`) and boolean props
 (`homeproxy.pac.require-trusted-client`) are read as literal values; `${...}` in them is not
 expanded.
 
@@ -103,10 +103,13 @@ request. Point it at the generated file:
 
 **Configure Proxy → Automatic**, URL `http://<host>:17890/proxy.pac`
 
-- `homeproxy.pac.direct` — hosts the phone should reach itself, exact host or `*.suffix` — answer
-  `DIRECT`.
-- every other host answers `PROXY <proxy>; DIRECT`, where `<proxy>` is `homeproxy.pac.proxy` when
-  set, otherwise the request's `Host` with `homeproxy.port`.
+- `homeproxy.pac.mode` decides the direction. `direct` (the default) sends only the hosts in
+  `homeproxy.pac.proxy-hosts` through homeproxy and everything else direct; `proxy` does the
+  reverse, sending everything through homeproxy except the hosts in `homeproxy.pac.direct`. Both
+  lists match an exact host or a `*.suffix`, and only the list belonging to the active mode is read;
+  the other one logs a warning at startup if it has entries.
+- `PROXY <proxy>` is `homeproxy.pac.proxy` when set, otherwise the request's `Host` with
+  `homeproxy.port`.
 - the file is served without a credential, because iOS ignores `ProxyUsername` and `ProxyPassword`
   in Automatic mode. `homeproxy.pac.require-trusted-client` (default on) serves it only to addresses
   in `homeproxy.trusted-clients`; anything else gets `403`. With no trusted clients the file goes to

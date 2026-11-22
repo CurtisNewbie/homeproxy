@@ -666,6 +666,75 @@ func TestProcessRejectsMalformedPACProxy(t *testing.T) {
 	}
 }
 
+func TestProcessRejectsInvalidPACMode(t *testing.T) {
+	proxyPort, managementPort := freePortPair(t)
+
+	conf := validCredentialsConf + "  pac:\n    mode: auto\n"
+	output := runToExit(t, writeConf(t, proxyPort, managementPort, conf))
+
+	if !strings.Contains(output, "homeproxy.pac.mode") {
+		t.Errorf("output does not name homeproxy.pac.mode:\n%s", output)
+	}
+	if !strings.Contains(output, `"auto"`) {
+		t.Errorf("output does not name the rejected mode:\n%s", output)
+	}
+}
+
+func TestProcessWarnsAboutInertPACList(t *testing.T) {
+	// The default mode is direct, so an entry in pac.direct is never consulted.
+	conf := validCredentialsConf + "  pac:\n    direct:\n      - example.com\n"
+	app := startAppWithConf(t, conf)
+	app.waitUntilHealthy(t)
+
+	const warning = "homeproxy.pac.direct has entries but homeproxy.pac.mode is direct: the list is ignored"
+	app.waitForLine(t, warning)
+	if n := strings.Count(app.output.String(), warning); n != 1 {
+		t.Errorf("inert-list warning appeared %d time(s), want 1\noutput:\n%s", n, app.output.String())
+	}
+}
+
+func TestProcessWarnsAboutInertPACListWhenBothListsHaveEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		ignored string
+	}{
+		{name: "direct mode ignores pac.direct", mode: "direct", ignored: "homeproxy.pac.direct"},
+		{name: "proxy mode ignores proxy-hosts", mode: "proxy", ignored: "homeproxy.pac.proxy-hosts"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := validCredentialsConf + fmt.Sprintf(`  pac:
+    mode: %s
+    direct:
+      - direct.example.com
+    proxy-hosts:
+      - proxied.example.com
+`, tt.mode)
+			app := startAppWithConf(t, conf)
+			app.waitUntilHealthy(t)
+
+			warning := fmt.Sprintf("%s has entries but homeproxy.pac.mode is %s: the list is ignored", tt.ignored, tt.mode)
+			app.waitForLine(t, warning)
+			if n := strings.Count(app.output.String(), warning); n != 1 {
+				t.Errorf("inert-list warning appeared %d time(s), want 1\noutput:\n%s", n, app.output.String())
+			}
+		})
+	}
+}
+
+func TestProcessDoesNotWarnWhenInactivePACListIsEmpty(t *testing.T) {
+	// Default direct mode consults proxy-hosts; pac.direct is empty.
+	conf := validCredentialsConf + "  pac:\n    proxy-hosts:\n      - example.com\n"
+	app := startAppWithConf(t, conf)
+	app.waitUntilHealthy(t)
+
+	if strings.Contains(app.output.String(), "the list is ignored") {
+		t.Errorf("process warned about an inert list with no entries\noutput:\n%s", app.output.String())
+	}
+}
+
 func TestProcessAcceptsNormalizedPACDirectEntries(t *testing.T) {
 	conf := validCredentialsConf + `  pac:
     direct:
