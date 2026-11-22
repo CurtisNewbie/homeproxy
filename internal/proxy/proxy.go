@@ -511,7 +511,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	trustedAddr, trusted := p.trusted.match(r.RemoteAddr)
 	if !auth.ok && !trusted {
 		authFailuresTotal.Inc()
-		miso.Debugf("proxy auth failed remote=%s name=%q", r.RemoteAddr, auth.attempted)
+		// Info, not Debug: a client in automatic mode sends no credential, so a
+		// refusal here is the whole reason a PAC file appears to be ignored.
+		miso.Infof("proxy auth failed remote=%s name=%q", r.RemoteAddr, auth.attempted)
 		writeAuthChallenge(w)
 		return
 	}
@@ -557,6 +559,10 @@ func (p *Proxy) servePAC(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
 	w.Header().Set("Cache-Control", "no-store")
+	// Info, so the box shows whether the client ever fetched the file: a PAC the
+	// client never loads and a PAC it loads but ignores look identical from the
+	// proxy, because neither produces a request log line.
+	miso.Infof("pac served remote=%s host=%s proxy=%s", r.RemoteAddr, r.Host, proxyAddr)
 	_, _ = io.WriteString(w, p.pac.script(proxyAddr))
 }
 
