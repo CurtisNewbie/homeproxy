@@ -25,8 +25,8 @@ docker build -t homeproxy:local .
 
 The image is one Alpine stage (`alpine:3.17` with `tzdata`) that copies `homeproxy_build` in as
 `./app_homeproxy` and starts it with `configFile=/usr/src/config/conf.yml`. The config file is
-mounted from the host at runtime; it is not baked into the image. The image itself declares no
-exposed ports; compose publishes only the proxy port, 17890.
+mounted from the host at runtime; it is not baked into the image. The image declares no ports —
+the deployment decides what to publish.
 
 ## Run locally
 
@@ -36,33 +36,25 @@ exposed ports; compose publishes only the proxy port, 17890.
 
 `conf.yml` in the repo is a development config: proxy on `17890`, management surface on `7990`,
 one credential (`phone` / `change-me`). Change the secret before exposing the port. The management
-port serves `/health` and `/metrics` only; keep it on localhost.
+port serves `/health` only; keep it on localhost. Metrics are off in both sample configs.
 
-## Run with Docker Compose
+## Run with Docker
+
+The image carries the binary only; the config is mounted. The deployment owns the compose file:
 
 ```bash
-# Optional: exported variables fill the ${...} placeholders in conf-prod.yml.
-export HOMEPROXY_UPSTREAM=upstream.example:3128
-export HOMEPROXY_UPSTREAM_USERNAME=upstream-user
-export HOMEPROXY_UPSTREAM_PASSWORD=upstream-secret
-
-docker compose up -d --build
+docker run -d --name homeproxy \
+  -p 17890:17890 \
+  -v "$PWD/conf-prod.yml:/usr/src/config/conf.yml:ro" \
+  homeproxy:local
 ```
 
-The compose build only copies the pre-compiled `homeproxy_build`; run the Linux build step from
-[Build](#build) first.
+Publish only `17890`. The management port (`server.port`, default `7990`) serves `/health`; leave it
+inside the container network. `${VAR}` placeholders in `conf-prod.yml` are expanded from the
+container environment, so `-e HOMEPROXY_UPSTREAM=…` fills them without rebuilding.
 
-`compose.yml`:
-
-- publishes **only** `17890` (the proxy port) to the host;
-- leaves the management port (`server.port`, default `7990`) unpublished — `/health` and `/metrics`
-  are reachable only from inside the container network;
-- joins only its own declared network, so other compose projects cannot reach it by name; the
-  network is a naming boundary, not an isolation guarantee;
-- mounts `conf-prod.yml` read-only at `/usr/src/config/conf.yml`.
-
-Secrets: replace the placeholder `homeproxy.users` entry in `conf-prod.yml` with a long random
-secret per device before deploying (edit the host file; it is mounted, not copied).
+`conf-prod.yml` ships without credentials and with an empty `trusted-clients`, so a container
+started from it exits at once. Fill in `trusted-clients`, or add a `users` entry, before starting.
 
 ## Configure
 
