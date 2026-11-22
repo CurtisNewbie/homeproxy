@@ -24,6 +24,13 @@ go test ./...
 
 ## Agent skills
 
+Two skills are mandatory. Load them before the first action of every task; they are not optional
+reading:
+
+- `dev-flow` — decides the lane and the record. No task starts without it.
+- `miso` — the framework contract. Load it before reading or changing configuration, bootstrap,
+  middleware, or logging code.
+
 ### Issue tracker
 
 Issues and specs live as local markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
