@@ -72,6 +72,32 @@ and miso expands the placeholder when it reads a string prop. List props (`homep
 (`homeproxy.pac.require-trusted-client`) are read as literal values; `${...}` in them is not
 expanded.
 
+## Managed clash (optional, off by default)
+
+A clash-compatible instance's selector group does not stay where it was put: a config swap or
+reload resets it to whichever member the config lists first, and a change made in a clash dashboard
+has no owner either. With `managed-clash.enabled` the service keeps one selector group on one
+configured member — at startup and again every `managed-clash.interval` it reads
+`GET /proxies/{selector}`, and only when `now` differs does it `PUT {"name":"<proxy-name>"}`.
+
+- It knows a controller URL, a secret, and two names. It never reads, parses, or writes the clash
+  config, never reloads it, and never fetches a subscription — refreshing that file is the
+  operator's own job.
+- Clash keeps node choice. When the configured member is a `URLTest` or `Fallback` group, that group
+  picks its own node; the service never calls a delay endpoint and never pins a node.
+- It is independent of this proxy's egress: the managed instance need not be the upstream, and
+  `homeproxy.upstream.*`, the PAC file, and the listeners are untouched.
+- Here the controller must be reachable from wherever the service runs — inside a container,
+  `localhost` is the container, so use the clash host's LAN address (or `host.docker.internal`).
+- Failures never block serving. Transport errors, `401`/`403`, and `5xx` are retried inside the
+  cycle for about a minute and then left to the next cycle; a `400`, a `404`, or a member absent
+  from the selector's `all` warns once for that cycle and is not retried. A manual dashboard change
+  is corrected within one interval — that is the point of the feature.
+- `enabled: true` with an empty controller, selector, or proxy name, or a non-positive `interval`,
+  refuses to start. A wrong controller, selector, or name is a runtime warning, not a config error.
+
+`interval` is a Go duration (`15m`, `90s`); a bare number means nanoseconds.
+
 ## Phone settings
 
 On the phone: **Settings → Wi-Fi → (i) next to the network → Configure Proxy → Manual**.

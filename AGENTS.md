@@ -10,7 +10,10 @@ Load the `dev-flow` skill before starting any task — a feature, a bugfix, or w
 It accepts absolute-form HTTP requests and `CONNECT` tunnels, authorizes a client by Basic
 credential or by trusted address, and forwards to a configurable upstream proxy (direct when the
 upstream is unset). It serves a generated PAC file at origin-form `GET /proxy.pac` on the proxy port,
-so a client can route per host.
+so a client can route per host. Optionally it also keeps one selector group of a clash-compatible
+instance on a configured member through that instance's controller (`managed-clash.*`); that
+instance need not be homeproxy's upstream, and the feature touches no egress, PAC, or listener
+setting.
 
 Stack: Go + miso (`github.com/curtisnewbie/miso`). Load the `miso` skill for framework questions.
 
