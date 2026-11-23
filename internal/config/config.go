@@ -63,6 +63,27 @@ const (
 	propManagementPort = "server.port"
 )
 
+// misoconfig-section: Managed Clash
+const (
+	// misoconfig-prop: Keep a clash selector group on one member; when false the controller is never called | false
+	propManagedClashEnabled = "managed-clash.enabled"
+
+	// misoconfig-prop: Clash controller base URL the selector is read and written through | http://localhost:9990
+	propManagedClashController = "managed-clash.controller"
+
+	// misoconfig-prop: Bearer secret for the controller; empty sends no Authorization header
+	propManagedClashSecret = "managed-clash.secret"
+
+	// misoconfig-prop: Selector group homeproxy keeps selected
+	propManagedClashSelector = "managed-clash.selector"
+
+	// misoconfig-prop: Member homeproxy keeps selected in the selector group
+	propManagedClashProxyName = "managed-clash.proxy-name"
+
+	// misoconfig-prop: Between drift checks, as a Go duration, e.g. 15m; a bare number means nanoseconds | 15m
+	propManagedClashInterval = "managed-clash.interval"
+)
+
 // misoconfig-default-start
 func init() {
 	miso.SetDefProp(propProxyPort, 17890)
@@ -71,6 +92,9 @@ func init() {
 	miso.SetDefProp(propPACRequireTrustedClient, true)
 	miso.SetDefProp(propDialTimeoutSeconds, 10)
 	miso.SetDefProp(propManagementPort, 7990)
+	miso.SetDefProp(propManagedClashEnabled, false)
+	miso.SetDefProp(propManagedClashController, "http://localhost:9990")
+	miso.SetDefProp(propManagedClashInterval, "15m")
 }
 
 // misoconfig-default-end
@@ -108,6 +132,12 @@ type Config struct {
 	PACRequireTrustedClient bool
 	TrustedClients          []string
 	DialTimeout             time.Duration
+	ManagedClashEnabled     bool
+	ManagedClashController  string
+	ManagedClashSecret      string
+	ManagedClashSelector    string
+	ManagedClashProxyName   string
+	ManagedClashInterval    time.Duration
 }
 
 func Load() (Config, error) {
@@ -133,6 +163,12 @@ func Load() (Config, error) {
 		PACRequireTrustedClient: miso.GetPropBool(propPACRequireTrustedClient),
 		TrustedClients:          miso.GetPropStrSlice(propTrustedClients),
 		DialTimeout:             time.Duration(miso.GetPropInt(propDialTimeoutSeconds)) * time.Second,
+		ManagedClashEnabled:     miso.GetPropBool(propManagedClashEnabled),
+		ManagedClashController:  strings.TrimSpace(miso.GetPropStr(propManagedClashController)),
+		ManagedClashSecret:      miso.GetPropStr(propManagedClashSecret),
+		ManagedClashSelector:    strings.TrimSpace(miso.GetPropStr(propManagedClashSelector)),
+		ManagedClashProxyName:   strings.TrimSpace(miso.GetPropStr(propManagedClashProxyName)),
+		ManagedClashInterval:    miso.GetPropDuration(propManagedClashInterval),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -157,6 +193,20 @@ func (c *Config) validate() error {
 	for i, cred := range c.Credentials {
 		if cred.Name == "" || cred.Secret == "" {
 			return fmt.Errorf("homeproxy.users entry %d must have both name and secret", i)
+		}
+	}
+	if c.ManagedClashEnabled {
+		if strings.TrimSpace(c.ManagedClashController) == "" {
+			return errors.New("managed-clash.controller must not be empty when managed-clash.enabled is true")
+		}
+		if strings.TrimSpace(c.ManagedClashSelector) == "" {
+			return errors.New("managed-clash.selector must not be empty when managed-clash.enabled is true")
+		}
+		if strings.TrimSpace(c.ManagedClashProxyName) == "" {
+			return errors.New("managed-clash.proxy-name must not be empty when managed-clash.enabled is true")
+		}
+		if c.ManagedClashInterval <= 0 {
+			return fmt.Errorf("managed-clash.interval must be positive, got %s", c.ManagedClashInterval)
 		}
 	}
 	c.PACMode = strings.ToLower(strings.TrimSpace(c.PACMode))

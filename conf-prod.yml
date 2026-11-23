@@ -67,3 +67,16 @@ homeproxy:
   # users:
   #   - name: phone
   #     secret: replace-with-a-long-random-secret
+# Managed clash keeps one selector group on a fixed member. Uncomment this block
+# to turn it on. The string props come from HOMEPROXY_MANAGED_CLASH_CONTROLLER,
+# HOMEPROXY_MANAGED_CLASH_SECRET, HOMEPROXY_MANAGED_CLASH_SELECTOR, and
+# HOMEPROXY_MANAGED_CLASH_PROXY_NAME; leave the secret env unset when the
+# controller needs no bearer token.
+# managed-clash:
+#   enabled: true
+#   controller: "${HOMEPROXY_MANAGED_CLASH_CONTROLLER:http://localhost:9990}"
+#   secret: "${HOMEPROXY_MANAGED_CLASH_SECRET:}"
+#   selector: "${HOMEPROXY_MANAGED_CLASH_SELECTOR:}"
+#   proxy-name: "${HOMEPROXY_MANAGED_CLASH_PROXY_NAME:}"
+#   # Go duration, e.g. "15m"; a bare number means nanoseconds.
+#   interval: 15m

@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 
+	"github.com/curtisnewbie/homeproxy/internal/clash"
 	"github.com/curtisnewbie/homeproxy/internal/config"
 	"github.com/curtisnewbie/homeproxy/internal/proxy"
 	"github.com/curtisnewbie/miso/miso"
@@ -37,6 +39,13 @@ func (s *service) start(rail miso.Rail) error {
 
 	s.proxyServer = proxy.Serve(ln, cfg)
 	miso.AddShutdownHook(func() { _ = s.proxyServer.Close() })
+
+	if cfg.ManagedClashEnabled {
+		client := clash.New(cfg.ManagedClashController, cfg.ManagedClashSecret, cfg.ManagedClashSelector, cfg.ManagedClashProxyName)
+		ctx, cancel := context.WithCancel(context.Background())
+		miso.AddShutdownHook(cancel)
+		go client.Run(ctx, cfg.ManagedClashInterval)
+	}
 	return nil
 }
 

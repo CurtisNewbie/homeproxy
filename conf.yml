@@ -49,3 +49,16 @@ homeproxy:
   users:
     - name: phone
       secret: change-me
+
+# Managed clash keeps one selector group on a fixed member: at startup and every
+# interval it reads the selector through the clash controller and sets it back
+# when it has drifted. The instance need not be homeproxy's upstream, and nothing
+# about homeproxy's own egress, PAC, or listeners changes.
+# managed-clash:
+#   enabled: false
+#   controller: "http://localhost:9990"
+#   secret: ""
+#   selector: "proxy"
+#   proxy-name: "node-name"
+#   # Go duration, e.g. "15m"; a bare number means nanoseconds.
+#   interval: 15m

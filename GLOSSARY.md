@@ -26,6 +26,17 @@ The HTTP proxy that homeproxy hands connections to when an egress other than dir
 configured.
 _Avoid_: parent proxy, chained proxy
 
+**Managed clash**:
+The clash-compatible instance whose controller homeproxy reaches to keep one group selection in
+place. It need not be homeproxy's upstream.
+_Avoid_: managed proxy, clash admin, upstream manager
+
+**Preferred proxy**:
+The proxy homeproxy keeps selected in the managed clash's selector — at startup, and again whenever a
+drift check finds it changed. When it is a `URLTest` or `Fallback` group, clash picks the node inside
+it; homeproxy never picks a node.
+_Avoid_: target group, region, node, member
+
 **Host list**:
 A list of target hosts — `homeproxy.bypass` and the two PAC lists. An entry is an exact host, which
 covers that host alone, or a `*.suffix`, which covers the suffix host and every host under it.

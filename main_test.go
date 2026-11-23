@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -881,4 +882,203 @@ func runToExit(t *testing.T, confPath string) string {
 		t.Fatalf("run homeproxy: %v\noutput:\n%s", err, out)
 	}
 	return string(out)
+}
+
+type fakeClashController struct {
+	server *httptest.Server
+
+	mu   sync.Mutex
+	now  string
+	all  []string
+	gets int
+	puts []string
+}
+
+func newFakeClashController(t *testing.T, now string, all ...string) *fakeClashController {
+	t.Helper()
+
+	f := &fakeClashController{now: now, all: all}
+	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			f.mu.Lock()
+			state := struct {
+				Name string   `json:"name"`
+				Type string   `json:"type"`
+				All  []string `json:"all"`
+				Now  string   `json:"now"`
+			}{Name: "proxy", Type: "Selector", All: f.all, Now: f.now}
+			f.gets++
+			f.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(state)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			f.mu.Lock()
+			f.puts = append(f.puts, string(body))
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *fakeClashController) counts() (gets int, puts []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gets, append([]string(nil), f.puts...)
+}
+
+func managedClashConf(controller string, enabled bool, interval string) string {
+	return fmt.Sprintf(`managed-clash:
+  enabled: %t
+  controller: %q
+  secret: node-secret
+  selector: proxy
+  proxy-name: node-b
+  interval: %s
+`, enabled, controller, interval)
+}
+
+func TestProcessCorrectsManagedClashSelectionAtStartup(t *testing.T) {
+	controller := newFakeClashController(t, "node-a", "node-a", "node-b")
+
+	app := startAppWithConf(t, validCredentialsConf+managedClashConf(controller.server.URL, true, "1h"))
+	app.waitUntilHealthy(t)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, puts := controller.counts()
+		if len(puts) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("selection PUT did not arrive; puts: %v\noutput:\n%s", puts, app.output.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, puts := controller.counts(); puts[0] != `{"name":"node-b"}` {
+		t.Errorf("PUT body = %q, want %q", puts[0], `{"name":"node-b"}`)
+	}
+
+	line := app.waitForLine(t, "managed clash", `selector "proxy"`, `now selects "node-b"`)
+	if strings.Contains(line, "node-secret") {
+		t.Errorf("info line contains the secret: %q", line)
+	}
+	if output := app.output.String(); strings.Contains(output, "node-secret") {
+		t.Errorf("process output contains the secret\noutput:\n%s", output)
+	}
+	if n := strings.Count(app.output.String(), "now selects"); n != 1 {
+		t.Errorf("found %d info lines for one write, want 1\noutput:\n%s", n, app.output.String())
+	}
+}
+
+func TestProcessLeavesManagedClashAloneWhenAlreadySelected(t *testing.T) {
+	controller := newFakeClashController(t, "node-b", "node-a", "node-b")
+
+	app := startAppWithConf(t, validCredentialsConf+managedClashConf(controller.server.URL, true, "1h"))
+	app.waitUntilHealthy(t)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		gets, _ := controller.counts()
+		if gets >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("selector GET did not arrive; gets: %d\noutput:\n%s", gets, app.output.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, puts := controller.counts(); len(puts) != 0 {
+		t.Errorf("received %d PUTs, want 0", len(puts))
+	}
+	if strings.Contains(app.output.String(), "now selects") {
+		t.Errorf("process logged an info line for an already-correct selection\noutput:\n%s", app.output.String())
+	}
+}
+
+func TestProcessNeverCallsTheControllerWhenManagedClashIsDisabled(t *testing.T) {
+	controller := newFakeClashController(t, "node-a", "node-a", "node-b")
+
+	app := startAppWithConf(t, validCredentialsConf+managedClashConf(controller.server.URL, false, "10ms"))
+	app.waitUntilHealthy(t)
+	time.Sleep(300 * time.Millisecond)
+
+	gets, puts := controller.counts()
+	if gets != 0 || len(puts) != 0 {
+		t.Errorf("disabled management made %d GETs and %d PUTs, want none", gets, len(puts))
+	}
+}
+
+func TestProcessServesWithAnUnreachableManagedClashController(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve controller address: %v", err)
+	}
+	controller := "http://" + ln.Addr().String()
+	_ = ln.Close()
+
+	app := startAppWithConf(t, validCredentialsConf+managedClashConf(controller, true, "1h"))
+	app.waitUntilHealthy(t)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", app.managementPort))
+	if err != nil {
+		t.Fatalf("GET /health with a dead controller: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestProcessRejectsIncompleteManagedClashConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		block string
+		key   string
+		want  string
+	}{
+		{
+			name:  "empty controller",
+			block: "  enabled: true\n  controller: \"\"\n  selector: proxy\n  proxy-name: node-b\n",
+			key:   "managed-clash.controller",
+			want:  "must not be empty",
+		},
+		{
+			name:  "empty selector",
+			block: "  enabled: true\n  controller: \"http://127.0.0.1:9990\"\n  selector: \"\"\n  proxy-name: node-b\n",
+			key:   "managed-clash.selector",
+			want:  "must not be empty",
+		},
+		{
+			name:  "empty proxy name",
+			block: "  enabled: true\n  controller: \"http://127.0.0.1:9990\"\n  selector: proxy\n  proxy-name: \"\"\n",
+			key:   "managed-clash.proxy-name",
+			want:  "must not be empty",
+		},
+		{
+			name:  "non-positive interval",
+			block: "  enabled: true\n  controller: \"http://127.0.0.1:9990\"\n  selector: proxy\n  proxy-name: node-b\n  interval: -1s\n",
+			key:   "managed-clash.interval",
+			want:  "must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyPort, managementPort := freePortPair(t)
+			output := runToExit(t, writeConf(t, proxyPort, managementPort, validCredentialsConf+"managed-clash:\n"+tt.block))
+
+			if !strings.Contains(output, tt.key) {
+				t.Errorf("output does not name %s:\n%s", tt.key, output)
+			}
+			if !strings.Contains(output, tt.want) {
+				t.Errorf("output does not explain the problem:\n%s", output)
+			}
+		})
+	}
 }

@@ -22,3 +22,14 @@ For more configuration, see [github.com/curtisnewbie/miso](https://github.com/Cu
 | homeproxy.trusted-clients            | Client addresses that use the proxy without a credential, as IPv4/IPv6 addresses or CIDRs                                                                      |               |
 | homeproxy.dial-timeout-seconds       | Timeout in seconds for dialling a target or upstream, including the upstream CONNECT handshake                                                                 | 10            |
 | server.port                          | Port of the miso management server                                                                                                                             | 7990          |
+
+## Managed Clash
+
+| property                 | description                                                                          | default value         |
+| ------------------------ | ------------------------------------------------------------------------------------ | --------------------- |
+| managed-clash.enabled    | Keep a clash selector group on one member; when false the controller is never called | false                 |
+| managed-clash.controller | Clash controller base URL the selector is read and written through                   | http://localhost:9990 |
+| managed-clash.secret     | Bearer secret for the controller; empty sends no Authorization header                |                       |
+| managed-clash.selector   | Selector group homeproxy keeps selected                                              |                       |
+| managed-clash.proxy-name | Member homeproxy keeps selected in the selector group                                |                       |
+| managed-clash.interval   | Between drift checks, as a Go duration, e.g. 15m; a bare number means nanoseconds    | 15m                   |
