@@ -149,8 +149,13 @@ list decides the phone's. A host reachable only from the home network — `nas.h
 sample — must stay off the PAC direct list, or the phone tries it directly and fails whenever it is
 away from home.
 
-Hosts not listed in `homeproxy.bypass` that resolve to a non-public address are refused (the
-private-network guard) — loopback, private, link-local, CGNAT, benchmarking, reserved, metadata and
-multicast ranges. List a host in `homeproxy.bypass` (exact host, or `*.suffix` covering the suffix
-and its subdomains) when it is yours; bypassed hosts use the direct egress and are exempt from that
-guard.
+Hosts not listed in `homeproxy.bypass` are checked by the private-network guard before anything is
+dialled, and refused with `403` when the target is a non-public address: an IP literal in loopback,
+private, link-local, CGNAT, benchmarking, reserved, metadata or multicast ranges; a local-only name
+such as `router`, `nas.local` or `x.internal`; or a name that resolves to one of those ranges. The
+last check runs only where homeproxy resolves the name itself — a direct dial, or `egress: all`. A
+target the PAC routes through the upstream is handed over untouched, because the upstream resolves
+it again. List a host in `homeproxy.bypass` (exact host, or `*.suffix` covering the suffix and its
+subdomains) when it is yours; bypassed hosts use the direct egress and are exempt from that guard.
+The guard is on by default; `homeproxy.private-network-guard: false` turns every one of these checks
+off and logs a warning at startup.

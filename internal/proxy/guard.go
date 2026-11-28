@@ -5,14 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	// resolutionTTL is how long a successful lookup is reused. It is short on
-	// purpose: it spares the lookup per request, not a changed DNS record.
-	resolutionTTL = 30 * time.Second
+	// resolutionTTL is how long a successful lookup is reused. It is long enough
+	// to spare a repeat visit the lookup, not to trust a changed record: a stale
+	// address fails the dial rather than reaching somewhere else.
+	resolutionTTL = 120 * time.Second
 	// resolutionFailureTTL is shorter so one transient failure does not hide a
 	// host for a whole success TTL.
 	resolutionFailureTTL = 5 * time.Second
@@ -24,6 +26,28 @@ const (
 // is distinct from a dial or lookup failure: the proxy answered 403 without
 // dialling anything.
 var errGuardRefused = errors.New("target refused by private-network guard")
+
+// localNameSuffixes are the closed set of suffixes that can only mean something
+// local: the bare suffix and every name under it are refused without a lookup.
+var localNameSuffixes = []string{"localhost", "local", "internal", "lan", "home.arpa"}
+
+// localOnlyName reports whether host, already HostOnly-normalized, can only
+// refer to the local network: a single-label name, or a bare/under one of the
+// local-use suffixes.
+func localOnlyName(host string) bool {
+	if host == "" {
+		return false
+	}
+	if !strings.Contains(host, ".") {
+		return true
+	}
+	for _, suffix := range localNameSuffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
 
 // resolver resolves target hosts to addresses, caching each result briefly so a
 // connection does not pay a lookup per request.

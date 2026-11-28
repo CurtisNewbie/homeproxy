@@ -32,11 +32,14 @@ const (
 	// misoconfig-prop: Password for authenticating against the upstream proxy
 	propUpstreamPassword = "homeproxy.upstream.password"
 
-	// misoconfig-prop: What the upstream carries: all sends every non-bypass target to it, pac sends only the targets the PAC file routes through the proxy and dials the rest direct | all
+	// misoconfig-prop: What the upstream carries: all sends every non-bypass target to it, pac sends only the targets the PAC file routes through the proxy and dials the rest direct; under pac, a target the PAC routes through the proxy is not resolved by the private-network guard | all
 	propUpstreamEgress = "homeproxy.upstream.egress"
 
 	// misoconfig-prop: Hosts that bypass the upstream proxy and are exempt from the private-network guard; exact host, or *.suffix covering the suffix and its subdomains
 	propBypass = "homeproxy.bypass"
+
+	// misoconfig-prop: Refuse a non-bypass target that is a non-public IP literal, a local-only name, or a name that resolves to a non-public address; false disables every guard check and changes no egress | true
+	propPrivateNetworkGuard = "homeproxy.private-network-guard"
 
 	// misoconfig-prop: PAC routing mode: direct proxies only homeproxy.pac.proxy-hosts, proxy exempts only homeproxy.pac.direct | direct
 	propPACMode = "homeproxy.pac.mode"
@@ -88,6 +91,7 @@ const (
 func init() {
 	miso.SetDefProp(propProxyPort, 17890)
 	miso.SetDefProp(propUpstreamEgress, "all")
+	miso.SetDefProp(propPrivateNetworkGuard, true)
 	miso.SetDefProp(propPACMode, "direct")
 	miso.SetDefProp(propPACRequireTrustedClient, true)
 	miso.SetDefProp(propDialTimeoutSeconds, 10)
@@ -125,6 +129,7 @@ type Config struct {
 	UpstreamPassword        string
 	UpstreamEgress          string
 	Bypass                  []string
+	PrivateNetworkGuard     bool
 	PACMode                 string
 	PACDirect               []string
 	PACProxyHosts           []string
@@ -156,6 +161,7 @@ func Load() (Config, error) {
 		UpstreamPassword:        miso.GetPropStr(propUpstreamPassword),
 		UpstreamEgress:          miso.GetPropStr(propUpstreamEgress),
 		Bypass:                  miso.GetPropStrSlice(propBypass),
+		PrivateNetworkGuard:     miso.GetPropBool(propPrivateNetworkGuard),
 		PACMode:                 miso.GetPropStr(propPACMode),
 		PACDirect:               miso.GetPropStrSlice(KeyPACDirect),
 		PACProxyHosts:           miso.GetPropStrSlice(KeyPACProxyHosts),

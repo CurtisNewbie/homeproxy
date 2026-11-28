@@ -385,6 +385,41 @@ func TestValidateManagedClash(t *testing.T) {
 	}
 }
 
+func TestLoadPrivateNetworkGuard(t *testing.T) {
+	t.Cleanup(func() { _ = miso.ReloadConfigFromStr("{}") })
+
+	t.Run("defaults to on", func(t *testing.T) {
+		if err := miso.ReloadConfigFromStr(`homeproxy:
+  trusted-clients: ["127.0.0.1"]
+`); err != nil {
+			t.Fatalf("reload config: %v", err)
+		}
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if !cfg.PrivateNetworkGuard {
+			t.Error("PrivateNetworkGuard = false, want the guard on by default")
+		}
+	})
+
+	t.Run("false is accepted", func(t *testing.T) {
+		if err := miso.ReloadConfigFromStr(`homeproxy:
+  private-network-guard: false
+  trusted-clients: ["127.0.0.1"]
+`); err != nil {
+			t.Fatalf("reload config: %v", err)
+		}
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.PrivateNetworkGuard {
+			t.Error("PrivateNetworkGuard = true, want the configured false")
+		}
+	})
+}
+
 func TestLoadManagedClash(t *testing.T) {
 	t.Cleanup(func() { _ = miso.ReloadConfigFromStr("{}") })
 

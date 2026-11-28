@@ -59,6 +59,9 @@ func New(cfg config.Config) *Proxy {
 		miso.Warnf("homeproxy.pac.require-trusted-client is on but homeproxy.trusted-clients is empty: /proxy.pac is served to nobody")
 	}
 	p := &Proxy{cfg: cfg, bypass: newBypassList(cfg.Bypass), pac: newPAC(cfg.PACMode, cfg.PACDirect, cfg.PACProxyHosts), trusted: newTrustedList(cfg.TrustedClients), resolver: newResolver()}
+	if !cfg.PrivateNetworkGuard {
+		miso.Warnf("homeproxy.private-network-guard is false: private IP literals, local-only names and any address they resolve to are reachable through the proxy")
+	}
 	if key, ignored := p.pac.ignoredList(); ignored {
 		miso.Warnf("%s has entries but homeproxy.pac.mode is %s: the list is ignored", key, p.pac.mode)
 	}
@@ -305,6 +308,11 @@ type egress struct {
 	// resolves again itself, so the request is still handed to it; without an
 	// upstream there is nothing left to dial.
 	lookupFailure error
+	// resolve is how long the guard's lookup took, when one ran. resolveSkipped
+	// records that the egress table said no lookup runs, so the request log can
+	// tell the two apart.
+	resolve        time.Duration
+	resolveSkipped bool
 }
 
 func (e egress) name() string {
@@ -320,6 +328,15 @@ func (e egress) name() string {
 	}
 }
 
+// resolveField renders the request log's resolve= value: the lookup's elapsed
+// time, or skipped when the egress table said none runs.
+func (e egress) resolveField() string {
+	if e.resolveSkipped {
+		return "skipped"
+	}
+	return e.resolve.String()
+}
+
 // egressContextKey carries the handler's decision to the transport's Proxy and
 // DialContext hooks.
 type egressContextKey struct{}
@@ -333,44 +350,74 @@ func egressFromContext(ctx context.Context) (egress, bool) {
 	return chosen, ok
 }
 
+// upstreamFor is the egress the target uses: the configured upstream, except
+// under egress pac for a target the PAC routes direct, which the proxy dials
+// itself. nil means a direct dial.
+func (p *Proxy) upstreamFor(target string) *upstream {
+	if p.cfg.UpstreamEgress == config.UpstreamEgressPAC && !p.pac.proxies(target) {
+		return nil
+	}
+	return p.upstream
+}
+
 // egressFor resolves the target host against homeproxy.bypass, applies the
-// private-network guard to every other host, then applies the configured
-// upstream. The result is the only place the egress is chosen, and its vetted
-// addresses are the ones a direct dial uses.
+// private-network guard, then applies the configured upstream. The guard decides
+// in order: off, a non-public IP literal, a local-only name, then a lookup only
+// where it can bind. The result is the only place the egress is chosen, and its
+// vetted addresses are the ones a direct dial uses.
 func (p *Proxy) egressFor(ctx context.Context, target string) egress {
 	if p.bypass.matches(target) {
-		return egress{bypass: true}
+		return egress{bypass: true, resolveSkipped: true}
 	}
 
 	host := config.HostOnly(target)
+	chosen := p.upstreamFor(target)
+
+	if !p.cfg.PrivateNetworkGuard {
+		return egress{upstream: chosen, resolveSkipped: true}
+	}
+
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if nonPublic(net.IP(addr.AsSlice())) {
+			return egress{refusal: fmt.Errorf("%w: %s is a non-public address", errGuardRefused, host), resolveSkipped: true}
+		}
+		return egress{upstream: chosen, resolveSkipped: true}
+	}
+
+	if localOnlyName(host) {
+		return egress{refusal: fmt.Errorf("%w: %s is a local-only name", errGuardRefused, host), resolveSkipped: true}
+	}
+
+	// A target the PAC hands to the upstream is not looked up: that upstream
+	// resolves the name again, so this verdict could not bind.
+	if p.cfg.UpstreamEgress == config.UpstreamEgressPAC && p.upstream != nil && p.pac.proxies(target) {
+		return egress{upstream: p.upstream, resolveSkipped: true}
+	}
+
 	resolveCtx := ctx
 	if p.cfg.DialTimeout > 0 {
 		var cancel context.CancelFunc
 		resolveCtx, cancel = context.WithTimeout(ctx, p.cfg.DialTimeout)
 		defer cancel()
 	}
+	resolveStart := time.Now()
 	addresses, err := p.resolver.resolve(resolveCtx, host)
+	resolve := time.Since(resolveStart)
 	if err != nil {
-		// Without an upstream a failed lookup leaves nothing to dial. With
-		// egress pac, a PAC-direct target is in the same position even when an
-		// upstream exists, because that upstream is not for this target.
-		if p.cfg.UpstreamEgress == config.UpstreamEgressPAC && !p.pac.proxies(target) {
-			return egress{lookupFailure: err}
+		// Without an upstream a failed lookup leaves nothing to dial. That
+		// includes a PAC-direct target even when an upstream exists, because
+		// that upstream is not for this target.
+		if chosen == nil {
+			return egress{lookupFailure: err, resolve: resolve}
 		}
-		return egress{upstream: p.upstream, lookupFailure: err}
+		return egress{upstream: chosen, lookupFailure: err, resolve: resolve}
 	}
 	for _, address := range addresses {
 		if nonPublic(address.IP) {
-			return egress{refusal: fmt.Errorf("%w: %s resolves to %s", errGuardRefused, host, address.IP)}
+			return egress{refusal: fmt.Errorf("%w: %s resolves to %s", errGuardRefused, host, address.IP), resolve: resolve}
 		}
 	}
-	// The guard has vetted the addresses. Egress pac keeps the upstream only for
-	// the targets the PAC routes through the proxy; the rest use the direct egress
-	// at these same addresses.
-	if p.cfg.UpstreamEgress == config.UpstreamEgressPAC && !p.pac.proxies(target) {
-		return egress{addresses: addresses}
-	}
-	return egress{upstream: p.upstream, addresses: addresses}
+	return egress{upstream: chosen, addresses: addresses, resolve: resolve}
 }
 
 // proxyURL is the forward half of the single egress decision: the upstream URL
@@ -525,8 +572,12 @@ func (c *upstreamConn) CloseWrite() error {
 }
 
 func Serve(ln net.Listener, cfg config.Config) *http.Server {
+	return serve(ln, New(cfg))
+}
+
+func serve(ln net.Listener, p *Proxy) *http.Server {
 	srv := &http.Server{
-		Handler:           New(cfg),
+		Handler:           p,
 		ReadHeaderTimeout: proxyReadHeaderTimeout,
 	}
 	go func() {
@@ -628,16 +679,18 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, identity clientI
 			bytesDownTotal.Add(float64(down.Load()))
 		}
 		egressName, bypass := "undecided", false
+		resolve := "skipped"
 		if decided {
 			egressName, bypass = chosen.name(), chosen.bypass
+			resolve = chosen.resolveField()
 		}
 		if failure != nil {
-			miso.Errorf("proxy request %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s error=%v",
-				identity.logFields(), target, egressName, bypass, up.Load(), down.Load(), time.Since(start), outcome, failure)
+			miso.Errorf("proxy request %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s resolve=%s outcome=%s error=%v",
+				identity.logFields(), target, egressName, bypass, up.Load(), down.Load(), time.Since(start), resolve, outcome, failure)
 			return
 		}
-		miso.Infof("proxy request %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
-			identity.logFields(), target, egressName, bypass, up.Load(), down.Load(), time.Since(start), outcome)
+		miso.Infof("proxy request %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s resolve=%s outcome=%s",
+			identity.logFields(), target, egressName, bypass, up.Load(), down.Load(), time.Since(start), resolve, outcome)
 	}()
 
 	// The request's Host is client-controlled, so it is validated before it can
@@ -878,15 +931,15 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request, identity clientId
 		case chosen.upstream == nil && chosen.lookupFailure != nil:
 			outcome = "lookup-failed"
 		}
-		miso.Errorf("proxy tunnel failed %s target=%s egress=%s bypass=%t duration=%s outcome=%s error=%v",
-			identity.logFields(), r.Host, chosen.name(), chosen.bypass, time.Since(start), outcome, err)
+		miso.Errorf("proxy tunnel failed %s target=%s egress=%s bypass=%t duration=%s resolve=%s outcome=%s error=%v",
+			identity.logFields(), r.Host, chosen.name(), chosen.bypass, time.Since(start), chosen.resolveField(), outcome, err)
 		writeStatus(w, status)
 		return
 	}
 	defer target.Close()
 	defer func() {
-		miso.Infof("proxy tunnel %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s outcome=%s",
-			identity.logFields(), r.Host, chosen.name(), chosen.bypass, up, down, time.Since(start), outcome)
+		miso.Infof("proxy tunnel %s target=%s egress=%s bypass=%t up=%d down=%d duration=%s resolve=%s outcome=%s",
+			identity.logFields(), r.Host, chosen.name(), chosen.bypass, up, down, time.Since(start), chosen.resolveField(), outcome)
 	}()
 
 	hijacker, ok := w.(http.Hijacker)

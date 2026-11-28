@@ -30,6 +30,11 @@ homeproxy:
   # listed here bypass the upstream and are exempt from the private-network
   # guard.
   bypass: []
+  # Refuse a non-bypass target that is a non-public IP literal, a local-only
+  # name, or a name that resolves to a non-public address. Commented out is the
+  # default (on); false removes every guard check, changes no egress, and warns
+  # at startup.
+  # private-network-guard: true
   # Client addresses that use the proxy without a credential: an IPv4/IPv6
   # address or a CIDR. Trust replaces the credential only — the private-network
   # guard still applies, so a private target still needs a bypass entry.

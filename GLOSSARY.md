@@ -53,9 +53,16 @@ request, between homeproxy and a direct connection. Its entries are the list the
 bypass list.
 _Avoid_: proxy URL, auto-proxy config, wpad.dat
 
+**Local-only name**:
+A name that can only refer to the local network: a single-label name such as `router`, or a name at
+or under `localhost`, `local`, `internal`, `lan` or `home.arpa`. Refused without a lookup.
+_Avoid_: private hostname, internal domain
+
 **Private-network guard**:
-The always-on check that refuses a non-bypass host resolving to a non-public address, before any
-connection is dialled.
+The check that refuses a non-bypass target before any connection is dialled: a non-public IP
+literal, a local-only name, or — only where homeproxy resolves the name itself — a name that
+resolves to a non-public address. On by default; `homeproxy.private-network-guard: false` turns it
+off without changing any egress.
 _Avoid_: private-address guard, SSRF filter
 
 **Tunnel**:

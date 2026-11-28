@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -40,6 +41,10 @@ func testProxyConfig() config.Config {
 		// refuses unless the host is declared as ours. Tests that exercise the
 		// guard clear this on purpose.
 		Bypass: []string{"127.0.0.1"},
+		// A hand-built Config does not run the property defaults, so the guard's
+		// load-time default is set here explicitly. Tests that turn it off do so
+		// on purpose.
+		PrivateNetworkGuard: true,
 		// The PAC gate is off unless a test asks for it: these Configs are built
 		// directly, so the config default does not apply.
 		PACRequireTrustedClient: false,
@@ -1524,6 +1529,312 @@ func TestProxyForbidsForwardToNonPublicAddresses(t *testing.T) {
 	assertProxyStillServing(t, addr)
 }
 
+func TestProxyForbidsLocalOnlyNamesBeforeUpstreamSeesIt(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	upstream := startFakeUpstream(t)
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = nil // the guard decides on every target
+	addr := startTestProxyWithConfig(t, cfg)
+	dialBefore := histogramCount(t, "homeproxy_dial_duration")
+
+	targets := []string{
+		"localhost:443",
+		"nas.local:443",
+		"x.internal:443",
+		"y.lan:443",
+		"z.home.arpa:443",
+		"router:443",
+		// Matching is case-insensitive and ignores the port and trailing dot.
+		"NAS.Local.:443",
+	}
+
+	for _, target := range targets {
+		conn := dialProxy(t, addr)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		writeConnect(t, conn, target, basicAuth(testCredentialName, testCredentialSecret))
+		_, status, headers := readResponseHead(t, bufio.NewReader(conn))
+		_ = conn.Close()
+		if status != http.StatusForbidden {
+			t.Errorf("CONNECT %s status = %d, want %d (headers: %v)", target, status, http.StatusForbidden, headers)
+		}
+
+		conn = dialProxy(t, addr)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+target+"/",
+			basicAuth(testCredentialName, testCredentialSecret), nil, "")
+		if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("GET http://%s/ status = %d, want %d", target, resp.StatusCode, http.StatusForbidden)
+		}
+
+		line := waitForLogLine(t, logs, "proxy", "target="+target)
+		assertResolveSkipped(t, line)
+	}
+
+	assertNoDial(t, dialBefore)
+	if seen := upstream.seen(); len(seen) != 0 {
+		t.Errorf("upstream observed %+v, want nothing", seen)
+	}
+
+	assertProxyStillServing(t, addr)
+}
+
+func TestProxyPrivateNetworkGuardOffLetsPrivateTargetsThrough(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(strings.TrimPrefix(target.URL, "http://"))
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = nil
+	cfg.PrivateNetworkGuard = false
+	addr := startTestProxyWithConfig(t, cfg)
+
+	waitForLogLine(t, logs, "homeproxy.private-network-guard is false")
+
+	targets := []string{"10.1.2.3:443", "router:443"}
+	for _, authority := range targets {
+		tunnel := openTunnel(t, addr, authority, basicAuth(testCredentialName, testCredentialSecret))
+		if status, _ := getThroughTunnel(t, tunnel, "http://"+authority+"/"); status != http.StatusOK {
+			t.Errorf("%s tunnel status = %d, want %d", authority, status, http.StatusOK)
+		}
+	}
+
+	seen := upstream.seen()
+	if len(seen) != len(targets) {
+		t.Fatalf("upstream observed %d request(s), want %d: %+v", len(seen), len(targets), seen)
+	}
+	for i, authority := range targets {
+		if seen[i].method != http.MethodConnect || seen[i].authority != authority {
+			t.Errorf("upstream observed %s %s, want CONNECT %s", seen[i].method, seen[i].authority, authority)
+		}
+	}
+}
+
+func TestProxyPACProxiedTargetReachesUpstreamWithoutGuardLookup(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(strings.TrimPrefix(target.URL, "http://"))
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"private.corp.example", "10.1.2.3"}
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	// The PAC hands this target to the upstream, which resolves it itself; the
+	// guard never looks it up, so a private address behind the name cannot be
+	// judged and the target is handed over untouched.
+	const proxied = "private.corp.example:443"
+	tunnel := openTunnel(t, addr, proxied, basicAuth(testCredentialName, testCredentialSecret))
+	if status, body := getThroughTunnel(t, tunnel, "http://"+proxied+"/"); status != http.StatusOK || body != "ok" {
+		t.Errorf("status/body = %d/%q, want %d/%q", status, body, http.StatusOK, "ok")
+	}
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].method != http.MethodConnect || seen[0].authority != proxied {
+		t.Errorf("upstream observed %s %s, want CONNECT %s", seen[0].method, seen[0].authority, proxied)
+	}
+
+	// A private IP literal is refused even when the PAC would route it through
+	// the proxy: the literal check runs before the egress decision.
+	if status := connectStatus(t, addr, "10.1.2.3:443"); status != http.StatusForbidden {
+		t.Errorf("private literal status = %d, want %d", status, http.StatusForbidden)
+	}
+}
+
+func TestProxyLogsResolveSkippedForPACProxiedTarget(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(strings.TrimPrefix(target.URL, "http://"))
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressPAC
+	cfg.PACMode = config.PACModeDirect
+	cfg.PACProxyHosts = []string{"private.corp.example"}
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://private.corp.example:443/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	line := waitForLogLine(t, logs, "proxy request", "target=private.corp.example:443")
+	assertResolveSkipped(t, line)
+}
+
+func TestProxyLogsResolveDurationForEgressAllTarget(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	targetAddr := startEchoTarget(t)
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(targetAddr)
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressAll
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	// .invalid never resolves, but the lookup still runs and its elapsed time is
+	// what the line must report; the upstream receives the request regardless.
+	const authority = "does-not-exist.invalid:443"
+	conn := openTunnel(t, addr, authority, basicAuth(testCredentialName, testCredentialSecret))
+	_ = conn.Close()
+
+	line := waitForLogLine(t, logs, "proxy tunnel", "target="+authority)
+	assertResolveDuration(t, line)
+}
+
+func TestProxyLogsResolveDurationForEgressAllForward(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(strings.TrimPrefix(target.URL, "http://"))
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.UpstreamEgress = config.UpstreamEgressAll
+	cfg.Bypass = nil
+	addr := startTestProxyWithLookup(t, cfg)
+
+	// A successful lookup under egress: all carries its own elapsed time; the
+	// absolute-form line is the one that must show it, not a failed lookup's.
+	const authority = "public.example"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+authority+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	seen := upstream.seen()
+	if len(seen) != 1 {
+		t.Fatalf("upstream observed %d request(s), want 1: %+v", len(seen), seen)
+	}
+	if seen[0].authority != authority {
+		t.Errorf("upstream authority = %q, want %q", seen[0].authority, authority)
+	}
+
+	line := waitForLogLine(t, logs, "proxy request", "target="+authority)
+	assertResolveDuration(t, line)
+}
+
+func TestProxyLogsResolveDurationForDirectTarget(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	cfg := testProxyConfig()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const authority = "does-not-exist.invalid:443"
+	if status := connectStatus(t, addr, authority); status != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d from the failed lookup", status, http.StatusBadGateway)
+	}
+
+	line := waitForLogLine(t, logs, "proxy tunnel failed", "target="+authority)
+	assertResolveDuration(t, line)
+}
+
+func TestProxyLogsResolveSkippedForPrivateLiteralRefusal(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	cfg := testProxyConfig()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const target = "10.1.2.3:443"
+	if status := connectStatus(t, addr, target); status != http.StatusForbidden {
+		t.Errorf("status = %d, want %d", status, http.StatusForbidden)
+	}
+
+	line := waitForLogLine(t, logs, "proxy tunnel failed", "target="+target)
+	assertResolveSkipped(t, line)
+}
+
+func TestProxyLogsResolveSkippedForLocalNameRefusal(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	cfg := testProxyConfig()
+	cfg.Bypass = nil
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const target = "router:443"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+target+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+
+	line := waitForLogLine(t, logs, "proxy request", "target="+target)
+	assertResolveSkipped(t, line)
+}
+
+func TestProxyLogsResolveSkippedWhenGuardOff(t *testing.T) {
+	logs := captureProxyLogs(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	upstream := startFakeUpstream(t)
+	upstream.setBackend(strings.TrimPrefix(target.URL, "http://"))
+
+	cfg := testProxyConfig()
+	cfg.Upstream = upstream.addr()
+	cfg.Bypass = nil
+	cfg.PrivateNetworkGuard = false
+	addr := startTestProxyWithConfig(t, cfg)
+
+	const privateTarget = "10.1.2.3:443"
+	conn := dialProxy(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAbsoluteFormRequest(t, conn, http.MethodGet, "http://"+privateTarget+"/",
+		basicAuth(testCredentialName, testCredentialSecret), nil, "")
+	if resp := readProxyResponse(t, conn, http.MethodGet); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	line := waitForLogLine(t, logs, "proxy request", "target="+privateTarget)
+	assertResolveSkipped(t, line)
+}
+
 func TestProxyBypassExactHostTunnelsDirectDespiteUpstream(t *testing.T) {
 	const responseBody = "bypass target reached directly"
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2639,6 +2950,28 @@ func startTestProxyAt(t *testing.T, listenAddr string, cfg config.Config) string
 	return ln.Addr().String()
 }
 
+// startTestProxyWithLookup starts a proxy whose resolver answers every host with
+// one fixed public address after a short delay, so a successful lookup is
+// deterministic and its elapsed time is measurably above zero.
+func startTestProxyWithLookup(t *testing.T, cfg config.Config) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	cfg.ProxyPort = ln.Addr().(*net.TCPAddr).Port
+	p := New(cfg)
+	p.resolver.lookup = func(context.Context, string) ([]net.IPAddr, error) {
+		time.Sleep(10 * time.Millisecond)
+		return []net.IPAddr{{IP: net.ParseIP("203.0.113.7")}}, nil
+	}
+	srv := serve(ln, p)
+	t.Cleanup(func() { _ = srv.Close() })
+
+	return ln.Addr().String()
+}
+
 func startCountingTarget(t *testing.T) (addr string, accepted *atomic.Int32) {
 	t.Helper()
 
@@ -3309,6 +3642,44 @@ func waitForLogLine(t *testing.T, logs *logBuffer, parts ...string) string {
 	}
 	t.Fatalf("log line containing %q not found\nlogs:\n%s", parts, logs.String())
 	return ""
+}
+
+// resolveField returns the value of the resolve= field on a request log line.
+func resolveField(t *testing.T, line string) string {
+	t.Helper()
+
+	for _, field := range strings.Fields(line) {
+		if value, ok := strings.CutPrefix(field, "resolve="); ok {
+			return value
+		}
+	}
+	t.Fatalf("log line carries no resolve field: %q", line)
+	return ""
+}
+
+func assertResolveSkipped(t *testing.T, line string) {
+	t.Helper()
+
+	if got := resolveField(t, line); got != "skipped" {
+		t.Errorf("resolve = %q, want skipped (line: %q)", got, line)
+	}
+}
+
+func assertResolveDuration(t *testing.T, line string) {
+	t.Helper()
+
+	got := resolveField(t, line)
+	if got == "skipped" {
+		t.Fatalf("resolve = skipped, want a duration (line: %q)", line)
+	}
+	duration, err := time.ParseDuration(got)
+	if err != nil {
+		t.Errorf("resolve = %q is not a Go duration: %v (line: %q)", got, err, line)
+		return
+	}
+	if duration <= 0 {
+		t.Errorf("resolve = %q, want a positive duration (line: %q)", got, line)
+	}
 }
 
 func TestProxyTrustsSingleAddressWithoutCredential(t *testing.T) {
