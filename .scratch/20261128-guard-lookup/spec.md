@@ -206,24 +206,24 @@ changes.
 
 ## Acceptance Criteria
 
-- [ ] a non-bypass `CONNECT` or absolute-form request for a private IP literal answers `403` with the
+- [x] a non-bypass `CONNECT` or absolute-form request for a private IP literal answers `403` with the
       guard on, and the fake upstream observes nothing
-- [ ] `localhost`, `nas.local`, `x.internal`, `y.lan`, `z.home.arpa` and `router` each answer `403`
+- [x] `localhost`, `nas.local`, `x.internal`, `y.lan`, `z.home.arpa` and `router` each answer `403`
       with the guard on, without a resolver query
-- [ ] `egress: pac` + a PAC-proxied target reaches the upstream with no lookup, and the log line
+- [x] `egress: pac` + a PAC-proxied target reaches the upstream with no lookup, and the log line
       carries `resolve=skipped`
-- [ ] `egress: pac` + a PAC-direct target is resolved, guarded and dialled at the vetted address
-- [ ] `egress: all` resolves every non-bypass target before contacting the upstream, and the log line
+- [x] `egress: pac` + a PAC-direct target is resolved, guarded and dialled at the vetted address
+- [x] `egress: all` resolves every non-bypass target before contacting the upstream, and the log line
       carries a `resolve=` duration
-- [ ] a lookup failure on `egress: all` still hands the request to the upstream; on a direct egress it
+- [x] a lookup failure on `egress: all` still hands the request to the upstream; on a direct egress it
       still answers `502`
-- [ ] `homeproxy.private-network-guard: false` lets a private literal and a local-only name through
+- [x] `homeproxy.private-network-guard: false` lets a private literal and a local-only name through
       to the upstream, and startup logs the warning
-- [ ] the guard defaults to on when the key is absent
-- [ ] the resolver's success TTL is 120 s and the failure TTL is unchanged
-- [ ] `doc/config.md` carries the new key, regenerated with `misoconfig -path doc/config.md`
-- [ ] both sample configs show the key
-- [ ] the full suite passes
+- [x] the guard defaults to on when the key is absent
+- [x] the resolver's success TTL is 120 s and the failure TTL is unchanged
+- [x] `doc/config.md` carries the new key, regenerated with `misoconfig -path doc/config.md`
+- [x] both sample configs show the key
+- [x] the full suite passes
 
 ## Out of Scope
 
