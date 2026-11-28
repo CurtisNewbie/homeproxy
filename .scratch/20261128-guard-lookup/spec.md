@@ -1,6 +1,6 @@
 # homeproxy — the guard stops paying for lookups it cannot use
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## Problem Statement
 

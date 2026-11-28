@@ -11,7 +11,7 @@ completely and the resolver keeps a success for 120 s instead of 30 s.
 
 **Repo:** homeproxy
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] a non-bypass `CONNECT` or absolute-form request for a private IP literal answers `403` with the guard on, and the fake upstream observes nothing
 - [x] `localhost`, `nas.local`, `x.internal`, `y.lan`, `z.home.arpa` and `router` each answer `403` with the guard on, without a resolver query

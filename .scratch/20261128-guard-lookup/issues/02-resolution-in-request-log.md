@@ -10,7 +10,7 @@ the fields the line already carries. No new metric.
 
 **Repo:** homeproxy
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] a PAC-proxied target logs `resolve=skipped`
 - [x] an `egress: all` target logs `resolve=` with a duration
