@@ -22,7 +22,7 @@ Stack: Go + miso (`github.com/curtisnewbie/miso`). Load the `miso` skill for fra
 ```bash
 go build -o homeproxy .
 ./homeproxy configFile=conf.yml
-go test ./...
+go test -count=1 ./...
 ```
 
 ## Agent skills
